@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Galata Aidat Takip</string>
+    <string name="title_activity_main">Galata Aidat Takip</string>
+    <string name="package_name">com.galata.aidattakip</string>
+    <string name="custom_url_scheme">com.galata.aidattakip</string>
+</resources>
