@@ -27,6 +27,8 @@ import MenuView from './components/MenuView.tsx';
 import MemberRegistrationView from './components/MemberRegistrationView.tsx';
 import ExitView from './components/ExitView.tsx';
 import { BuildingInfo, ActiveTab, Transaction, Unit, BoardMember, FileEntry, BalanceSummary } from './types.ts';
+import { db } from './databaseService.ts';
+import { useBackButton } from './useBackButton.ts';
 
 const REGISTRY_KEY = 'galata_v16_mgmt_registry';
 const ACTIVE_MGMT_ID_KEY = 'galata_v16_active_mgmt_id';
@@ -37,15 +39,18 @@ const STORAGE_KEYS = {
   EXITED: 'galata_v16_is_exited'
 };
 
-const DEFAULT_BUILDING_INFO: BuildingInfo = { 
-  name: "BİNA ADI TANIMLANMADI", 
-  address: "", 
-  role: "Yönetici", 
+// localStorage key prefix scoped to a specific management
+const storagePrefix = (mgmtId: string) => `galata_v16_${mgmtId}_`;
+
+const DEFAULT_BUILDING_INFO: BuildingInfo = {
+  name: "BİNA ADI TANIMLANMADI",
+  address: "",
+  role: "Yönetici",
   managerName: "",
   taxNo: "",
   duesAmount: 0,
-  isManagerExempt: false, 
-  managerUnitId: '', 
+  isManagerExempt: false,
+  managerUnitId: '',
   isAutoDuesEnabled: true
 };
 
@@ -54,20 +59,20 @@ const loadFromStorage = (key: string, defaultValue: any) => {
     const stored = localStorage.getItem(key);
     if (!stored || stored === 'null' || stored === 'undefined') return defaultValue;
     return JSON.parse(stored);
-  } catch (e) { 
-    return defaultValue; 
+  } catch (e) {
+    return defaultValue;
   }
 };
 
 const App: React.FC = () => {
   const [isExited, setIsExited] = useState(() => sessionStorage.getItem(STORAGE_KEYS.EXITED) === 'true');
-  const [isAuthenticated, setIsAuthenticated] = useState(() => 
+  const [isAuthenticated, setIsAuthenticated] = useState(() =>
     localStorage.getItem(STORAGE_KEYS.AUTH) === 'true' || sessionStorage.getItem(STORAGE_KEYS.AUTH) === 'true'
   );
   const [isAdmin, setIsAdmin] = useState(() => localStorage.getItem(STORAGE_KEYS.ROLE) === 'admin');
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
   const [activeSubView, setActiveSubView] = useState<string | null>(null);
-  // Geri tu�u handler
+  // Geri tuşu handler
   useBackButton(activeTab, activeSubView, setActiveTab, setActiveSubView);
 
 
@@ -83,7 +88,7 @@ const App: React.FC = () => {
   const [boardMembers, setBoardMembers] = useState<BoardMember[]>([]);
   const [files, setFiles] = useState<FileEntry[]>([]);
 
-  // 1. ADIM: VERİLERİ YÜKLEME
+  // 1. ADIM: VERİLERİ YÜKLEME (activeMgmtId değiştiğinde state temizle + yeniden yükle)
   useEffect(() => {
     if (!activeMgmtId) {
       setBuildingInfo(DEFAULT_BUILDING_INFO);
@@ -95,7 +100,17 @@ const App: React.FC = () => {
       return;
     }
 
-    const prefix = `galata_v16_${activeMgmtId}_`;
+    // State'i temizle (izolasyon güvencesi)
+    setBuildingInfo(DEFAULT_BUILDING_INFO);
+    setUnits([]);
+    setTransactions([]);
+    setBoardMembers([]);
+    setFiles([]);
+
+    // Firebase database service'i güncelle
+    db.setCurrentSession(activeMgmtId);
+
+    const prefix = storagePrefix(activeMgmtId);
     const loadedInfo = loadFromStorage(`${prefix}info`, DEFAULT_BUILDING_INFO);
     const loadedUnits = loadFromStorage(`${prefix}units`, []);
     const loadedTxs = loadFromStorage(`${prefix}transactions`, []);
@@ -107,7 +122,7 @@ const App: React.FC = () => {
     setTransactions(loadedTxs);
     setBoardMembers(loadedBoard);
     setFiles(loadedFiles);
-    
+
     // ÖNEMLİ: Veriler yüklendi, artık bu ID için kaydetme yapılabilir
     loadedIdRef.current = activeMgmtId;
   }, [activeMgmtId]);
@@ -118,13 +133,13 @@ const App: React.FC = () => {
     // Bu sayede eski ID'nin verileri yeni ID üzerine yazılmaz
     if (!activeMgmtId || activeMgmtId !== loadedIdRef.current) return;
 
-    const prefix = `galata_v16_${activeMgmtId}_`;
+    const prefix = storagePrefix(activeMgmtId);
     localStorage.setItem(`${prefix}info`, JSON.stringify(buildingInfo));
     localStorage.setItem(`${prefix}units`, JSON.stringify(units));
     localStorage.setItem(`${prefix}transactions`, JSON.stringify(transactions));
     localStorage.setItem(`${prefix}board`, JSON.stringify(boardMembers));
     localStorage.setItem(`${prefix}files`, JSON.stringify(files));
-    
+
     // Registry ismini güncelle
     if (buildingInfo.name !== DEFAULT_BUILDING_INFO.name) {
       setManagements(prev => prev.map(m => m.id === activeMgmtId ? { ...m, name: buildingInfo.name } : m));
@@ -139,40 +154,43 @@ const App: React.FC = () => {
     localStorage.setItem(ACTIVE_MGMT_ID_KEY, activeMgmtId);
   }, [activeMgmtId]);
 
+  // --- Management Lifecycle Handlers ---
+
   const handleSwitchMgmt = (id: string) => {
     // Geçiş anında kaydetmeyi durdurmak için ref'i hemen sıfırla
     loadedIdRef.current = 'switching';
-    db.setCurrentSession(id);
-    console.log('?? Oturum de�i�tirildi:', id); 
+    db.switchManagement(id);
+    console.log('🔀 Oturum değiştirildi:', id);
     setActiveMgmtId(id);
     setActiveTab('home');
     setActiveSubView(null);
   };
 
-    const handleCreateMgmt = (data: any) => {
-    const newId = `mgmt_${Date.now()}`;
-    const newMgmt = { id: newId, name: data.name };
+  const handleCreateMgmt = async (data: any) => {
+    try {
+      // Firebase'de managements/{mgmtId}/meta oluştur
+      const newId = await db.createManagement(data.name);
+      const newMgmt = { id: newId, name: data.name };
 
-    // Yeni oturum ID'sini ayarla
-    db.setCurrentSession(newId);
-    console.log('?? Yeni y�netim olu�turuldu:', newId, data.name);
+      // Yeni yönetim bilgilerini Firebase'e kaydet
+      db.setCurrentSession(newId);
+      await db.saveBuildingInfo(data);
+      console.log('✅ Yeni yönetim Firebase\'e kaydedildi:', newId);
 
-    // Yeni y�netim bilgilerini Firebase'e kaydet
-    db.saveBuildingInfo(data).then(() => {
-      console.log('? Yeni y�netim Firebase\'e kaydedildi');
-    });
-
-    setManagements(prev => [...prev, newMgmt]);
-    setBuildingInfo(data);
-    setActiveMgmtId(newId);
+      setManagements(prev => [...prev, newMgmt]);
+      setBuildingInfo(data);
+      setActiveMgmtId(newId);
+    } catch (error) {
+      console.error('Yönetim oluşturma hatası:', error);
+    }
   };
 
   const handleDeleteMgmt = async (id: string) => {
-    // Firebase'den sil
-    await db.deleteSession(id);
-    
+    // Firebase'den sil (managements/{id} altındaki tüm veriyi temizler)
+    await db.deleteManagement(id);
+
     // localStorage'dan sil
-    const prefix = `galata_v16_${id}_`;
+    const prefix = storagePrefix(id);
     localStorage.removeItem(`${prefix}info`);
     localStorage.removeItem(`${prefix}units`);
     localStorage.removeItem(`${prefix}transactions`);
@@ -257,7 +275,7 @@ const App: React.FC = () => {
           activeSubView === 'aidat-cizelge' ? <AidatCizelgeView units={unitsWithBalances} transactions={transactions} info={buildingInfo} onClose={() => setActiveSubView(null)} onAddDues={() => {}} onAddFile={(n, c, d) => setFiles(p => [...p, { id: Math.random().toString(36).slice(2), name: n, category: c, date: new Date().toLocaleDateString('tr-TR'), size: '1 MB', extension: 'pdf', data: d }])} /> :
           activeSubView === 'monthly-report' ? <MonthlyReportView transactions={transactions} units={unitsWithBalances} onClose={() => setActiveSubView(null)} buildingName={buildingInfo.name} onAddFile={(n, c, d) => setFiles(p => [...p, { id: Math.random().toString(36).slice(2), name: n, category: c, date: new Date().toLocaleDateString('tr-TR'), size: '1 MB', extension: 'pdf', data: d }])} /> :
           activeSubView === 'yearly-report' ? <YearlyReportView transactions={transactions} units={unitsWithBalances} onClose={() => setActiveSubView(null)} buildingName={buildingInfo.name} onAddFile={(n, c, d) => setFiles(p => [...p, { id: Math.random().toString(36).slice(2), name: n, category: c, date: new Date().toLocaleDateString('tr-TR'), size: '1 MB', extension: 'pdf', data: d }])} /> :
-          activeSubView === 'board' ? <BoardView members={boardMembers} onClose={() => setActiveSubView(null)} buildingName={buildingInfo.name} onAddMember={m => setBoardMembers(p => [...p, { ...m, id: Math.random().toString(36).slice(2) }])} onDeleteMember={id => setBoardMembers(p => p.filter(x => x.id !== id))} onClearAll={() => setBoardMembers([])} /> : 
+          activeSubView === 'board' ? <BoardView members={boardMembers} onClose={() => setActiveSubView(null)} buildingName={buildingInfo.name} onAddMember={m => setBoardMembers(p => [...p, { ...m, id: Math.random().toString(36).slice(2) }])} onDeleteMember={id => setBoardMembers(p => p.filter(x => x.id !== id))} onClearAll={() => setBoardMembers([])} /> :
           activeSubView === 'member-registration' ? <MemberRegistrationView onClose={() => setActiveSubView(null)} onSave={u => setUnits(p => [...p, { ...u, id: Math.random().toString(36).slice(2), credit: 0, debt: 0 }])} /> : null
         ) : (
           activeTab === 'menu' ? <MenuView isAdmin={isAdmin} onActionClick={(sv, tab) => { if(tab) setActiveTab(tab); else setActiveSubView(sv); }} /> :
@@ -270,7 +288,7 @@ const App: React.FC = () => {
               <LastTransaction transaction={transactions[0] || null} />
             </div>
           ) :
-          activeTab === 'sessions' ? <SessionsView buildingInfo={buildingInfo} onUpdateInfo={setBuildingInfo} managements={managements} activeId={activeMgmtId} onClose={() => setActiveTab('home')} onSwitch={handleSwitchMgmt} onCreate={handleCreateMgmt} onDelete={handleDeleteMgmt} /> : 
+          activeTab === 'sessions' ? <SessionsView buildingInfo={buildingInfo} onUpdateInfo={setBuildingInfo} managements={managements} activeId={activeMgmtId} onClose={() => setActiveTab('home')} onSwitch={handleSwitchMgmt} onCreate={handleCreateMgmt} onDelete={handleDeleteMgmt} /> :
           activeTab === 'files' ? <FilesView files={files} onAddFile={f => setFiles(p => [...p, { ...f, id: Math.random().toString(36).slice(2) }])} onDeleteFile={id => setFiles(p => p.filter(x => x.id !== id))} /> : null
         )}
       </main>
@@ -280,15 +298,3 @@ const App: React.FC = () => {
 };
 
 export default App;
-
-
-
-
-
-
-
-
-
-
-
-

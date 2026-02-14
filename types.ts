@@ -83,4 +83,10 @@ export interface FileEntry {
   data?: string; // Dosya içeriği (base64/dataURL)
 }
 
+export interface ManagementMeta {
+  name: string;
+  ownerUid: string;
+  createdAt: number;
+}
+
 export type ActiveTab = 'home' | 'menu' | 'sessions' | 'settings' | 'files';
