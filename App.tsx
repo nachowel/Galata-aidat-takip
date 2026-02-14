@@ -30,7 +30,6 @@ import { BuildingInfo, ActiveTab, Transaction, Unit, BoardMember, FileEntry, Bal
 import { db } from './databaseService.ts';
 import { useBackButton } from './useBackButton.ts';
 
-const REGISTRY_KEY = 'galata_v16_mgmt_registry';
 const ACTIVE_MGMT_ID_KEY = 'galata_v16_active_mgmt_id';
 
 const STORAGE_KEYS = {
@@ -38,9 +37,6 @@ const STORAGE_KEYS = {
   ROLE: 'galata_v16_role',
   EXITED: 'galata_v16_is_exited'
 };
-
-// localStorage key prefix scoped to a specific management
-const storagePrefix = (mgmtId: string) => `galata_v16_${mgmtId}_`;
 
 const DEFAULT_BUILDING_INFO: BuildingInfo = {
   name: "BİNA ADI TANIMLANMADI",
@@ -52,16 +48,6 @@ const DEFAULT_BUILDING_INFO: BuildingInfo = {
   isManagerExempt: false,
   managerUnitId: '',
   isAutoDuesEnabled: true
-};
-
-const loadFromStorage = (key: string, defaultValue: any) => {
-  try {
-    const stored = localStorage.getItem(key);
-    if (!stored || stored === 'null' || stored === 'undefined') return defaultValue;
-    return JSON.parse(stored);
-  } catch (e) {
-    return defaultValue;
-  }
 };
 
 const App: React.FC = () => {
@@ -76,10 +62,9 @@ const App: React.FC = () => {
   useBackButton(activeTab, activeSubView, setActiveTab, setActiveSubView);
 
 
-  const [managements, setManagements] = useState<{id: string, name: string}[]>(() => loadFromStorage(REGISTRY_KEY, []));
+  const [managements, setManagements] = useState<{ id: string; name: string }[]>([]);
   const [activeMgmtId, setActiveMgmtId] = useState<string>(() => localStorage.getItem(ACTIVE_MGMT_ID_KEY) || '');
 
-  // VERİLERİN YÜKLENME DURUMUNU TAKİP EDEN KİLİT
   const loadedIdRef = useRef<string>(activeMgmtId);
 
   const [buildingInfo, setBuildingInfo] = useState<BuildingInfo>(DEFAULT_BUILDING_INFO);
@@ -88,7 +73,20 @@ const App: React.FC = () => {
   const [boardMembers, setBoardMembers] = useState<BoardMember[]>([]);
   const [files, setFiles] = useState<FileEntry[]>([]);
 
-  // 1. ADIM: VERİLERİ YÜKLEME (activeMgmtId değiştiğinde state temizle + yeniden yükle)
+  // Firestore: Kullanıcıya ait yönetim listesini yükle; activeMgmtId yoksa ilkini seç
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    db.getUserManagements().then((list) => {
+      setManagements(list.map((m) => ({ id: m.id, name: m.name ?? '' })));
+      setActiveMgmtId((prev) => {
+        const ids = list.map((m) => m.id);
+        if (!prev || !ids.includes(prev)) return list[0]?.id ?? '';
+        return prev;
+      });
+    });
+  }, [isAuthenticated]);
+
+  // activeMgmtId değişince Firestore'dan verileri yükle
   useEffect(() => {
     if (!activeMgmtId) {
       setBuildingInfo(DEFAULT_BUILDING_INFO);
@@ -100,55 +98,44 @@ const App: React.FC = () => {
       return;
     }
 
-    // State'i temizle (izolasyon güvencesi)
     setBuildingInfo(DEFAULT_BUILDING_INFO);
     setUnits([]);
     setTransactions([]);
     setBoardMembers([]);
     setFiles([]);
 
-    // Firebase database service'i güncelle
     db.setCurrentSession(activeMgmtId);
 
-    const prefix = storagePrefix(activeMgmtId);
-    const loadedInfo = loadFromStorage(`${prefix}info`, DEFAULT_BUILDING_INFO);
-    const loadedUnits = loadFromStorage(`${prefix}units`, []);
-    const loadedTxs = loadFromStorage(`${prefix}transactions`, []);
-    const loadedBoard = loadFromStorage(`${prefix}board`, []);
-    const loadedFiles = loadFromStorage(`${prefix}files`, []);
-
-    setBuildingInfo(loadedInfo);
-    setUnits(loadedUnits);
-    setTransactions(loadedTxs);
-    setBoardMembers(loadedBoard);
-    setFiles(loadedFiles);
-
-    // ÖNEMLİ: Veriler yüklendi, artık bu ID için kaydetme yapılabilir
-    loadedIdRef.current = activeMgmtId;
+    Promise.all([
+      db.getBuildingInfo(),
+      db.getUnits(),
+      db.getTransactions(),
+      db.getBoardMembers(),
+      db.getFiles()
+    ]).then(([info, u, txs, board, fs]) => {
+      setBuildingInfo(info ?? DEFAULT_BUILDING_INFO);
+      setUnits(u ?? []);
+      setTransactions(txs ?? []);
+      setBoardMembers(board ?? []);
+      setFiles(fs ?? []);
+      loadedIdRef.current = activeMgmtId;
+    });
   }, [activeMgmtId]);
 
-  // 2. ADIM: VERİLERİ KAYDETME
+  // Firestore'a kaydet (sadece yüklü olan ID ile eşleşiyorsa)
   useEffect(() => {
-    // KRİTİK KONTROL: Sadece state'deki veriler o anki aktif ID'ye aitse kaydet
-    // Bu sayede eski ID'nin verileri yeni ID üzerine yazılmaz
     if (!activeMgmtId || activeMgmtId !== loadedIdRef.current) return;
 
-    const prefix = storagePrefix(activeMgmtId);
-    localStorage.setItem(`${prefix}info`, JSON.stringify(buildingInfo));
-    localStorage.setItem(`${prefix}units`, JSON.stringify(units));
-    localStorage.setItem(`${prefix}transactions`, JSON.stringify(transactions));
-    localStorage.setItem(`${prefix}board`, JSON.stringify(boardMembers));
-    localStorage.setItem(`${prefix}files`, JSON.stringify(files));
+    db.saveBuildingInfo(buildingInfo).catch((e) => console.error('saveBuildingInfo', e));
+    db.saveUnits(units).catch((e) => console.error('saveUnits', e));
+    db.saveTransactions(transactions).catch((e) => console.error('saveTransactions', e));
+    db.saveBoardMembers(boardMembers).catch((e) => console.error('saveBoardMembers', e));
+    db.saveFiles(files).catch((e) => console.error('saveFiles', e));
 
-    // Registry ismini güncelle
     if (buildingInfo.name !== DEFAULT_BUILDING_INFO.name) {
-      setManagements(prev => prev.map(m => m.id === activeMgmtId ? { ...m, name: buildingInfo.name } : m));
+      setManagements((prev) => prev.map((m) => (m.id === activeMgmtId ? { ...m, name: buildingInfo.name } : m)));
     }
   }, [buildingInfo, units, transactions, boardMembers, files, activeMgmtId]);
-
-  useEffect(() => {
-    localStorage.setItem(REGISTRY_KEY, JSON.stringify(managements));
-  }, [managements]);
 
   useEffect(() => {
     localStorage.setItem(ACTIVE_MGMT_ID_KEY, activeMgmtId);
@@ -168,36 +155,26 @@ const App: React.FC = () => {
 
   const handleCreateMgmt = async (data: any) => {
     try {
-      // Firebase'de managements/{mgmtId}/meta oluştur
       const newId = await db.createManagement(data.name);
       const newMgmt = { id: newId, name: data.name };
 
-      // Yeni yönetim bilgilerini Firebase'e kaydet
       db.setCurrentSession(newId);
-      await db.saveBuildingInfo(data);
-      console.log('✅ Yeni yönetim Firebase\'e kaydedildi:', newId);
+      const buildingData: BuildingInfo = { ...DEFAULT_BUILDING_INFO, ...data };
+      await db.saveBuildingInfo(buildingData);
+      console.log('✅ Yeni yönetim Firestore\'a kaydedildi:', newId);
 
-      setManagements(prev => [...prev, newMgmt]);
-      setBuildingInfo(data);
+      setManagements((prev) => [...prev, newMgmt]);
+      setBuildingInfo(buildingData);
       setActiveMgmtId(newId);
+      loadedIdRef.current = newId;
     } catch (error) {
       console.error('Yönetim oluşturma hatası:', error);
     }
   };
 
   const handleDeleteMgmt = async (id: string) => {
-    // Firebase'den sil (managements/{id} altındaki tüm veriyi temizler)
     await db.deleteManagement(id);
-
-    // localStorage'dan sil
-    const prefix = storagePrefix(id);
-    localStorage.removeItem(`${prefix}info`);
-    localStorage.removeItem(`${prefix}units`);
-    localStorage.removeItem(`${prefix}transactions`);
-    localStorage.removeItem(`${prefix}board`);
-    localStorage.removeItem(`${prefix}files`);
-
-    setManagements(prev => prev.filter(m => m.id !== id));
+    setManagements((prev) => prev.filter((m) => m.id !== id));
     if (activeMgmtId === id) {
       loadedIdRef.current = '';
       setActiveMgmtId('');
