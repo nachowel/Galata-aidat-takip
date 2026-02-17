@@ -10,10 +10,10 @@ import {
   collection,
   doc,
   getDocs,
-  getDoc,
-  setDoc,
-  writeBatch
+  getDoc
 } from 'firebase/firestore';
+import { httpsCallable } from 'firebase/functions';
+import { functions } from '../firebaseConfig.ts';
 
 // --------------- Type Definitions ---------------
 
@@ -217,18 +217,17 @@ export function generateMonthlyDuesDryRun(
 // 4. generateMonthlyDuesAndCommit — Firestore Commit Layer
 // ============================================================
 
-const CHUNK_SIZE = 400;
+const CHUNK_SIZE = 25;
 
 /**
- * Read units, transactions and aidat rates from Firestore,
- * run the dry-run engine, then write new transactions in
- * chunked batches (max 400 ops per batch to stay under the
- * Firestore 500-operation limit with safety margin).
+ * Read units + ledger + aidat rates from Firestore, run the
+ * dry-run engine, then commit new entries through server-side
+ * callable (client never writes ledger directly).
  *
  * Firestore paths:
  *   managements/{mgmtId}            → duesAmount, isManagerExempt, managerUnitId
  *   managements/{mgmtId}/units      → unit docs
- *   managements/{mgmtId}/transactions → existing + new transactions
+ *   managements/{mgmtId}/ledger      → existing + new entries
  *   managements/{mgmtId}/aidatRates → rate history docs
  *
  * Returns { created: number } with the count of written transactions.
@@ -265,21 +264,33 @@ export async function generateMonthlyDuesAndCommit(
     });
   }
 
-  // ---- 3. Read existing transactions ----
-  const txSnap = await getDocs(collection(firestoreDb, 'managements', mgmtId, 'transactions'));
+  // ---- 3. Read existing ledger entries ----
+  const txSnap = await getDocs(collection(firestoreDb, 'managements', mgmtId, 'ledger'));
   const transactions: LedgerTransaction[] = txSnap.docs.map(d => {
     const data = d.data();
+    const direction: 'DEBIT' | 'CREDIT' = (data.type === 'CREDIT' || data.direction === 'CREDIT')
+      ? 'CREDIT'
+      : 'DEBIT';
+    const amount = typeof data.amountMinor === 'number'
+      ? Number(data.amountMinor) / 100
+      : (Number(data.amount) || 0);
+    const kind = data.metadata?.kind;
+    const inferredType = d.id.startsWith('aidat_') || kind === 'DUES'
+      ? 'AIDAT_AUTO'
+      : (d.id.startsWith('creditApply_') || kind === 'CREDIT_APPLY'
+        ? 'CREDIT_APPLY'
+        : (data.legacyCategoryType ?? (direction === 'CREDIT' ? 'GELİR' : 'GİDER')));
     return {
       id: d.id,
-      type: data.type ?? '',
-      direction: data.direction ?? (data.type === 'GELİR' ? 'CREDIT' : 'DEBIT'),
-      amount: Number(data.amount) || 0,
+      type: inferredType,
+      direction,
+      amount,
       unitId: data.unitId,
       periodMonth: data.periodMonth,
       periodYear: data.periodYear,
       createdAt: data.createdAt?.toDate?.() ?? undefined
     };
-  });
+  }).filter(tx => tx.type === 'AIDAT_AUTO' || tx.type === 'CREDIT_APPLY');
 
   // ---- 4. Read aidat rates ----
   const ratesSnap = await getDocs(collection(firestoreDb, 'managements', mgmtId, 'aidatRates'));
@@ -319,25 +330,52 @@ export async function generateMonthlyDuesAndCommit(
     return { created: 0 };
   }
 
-  // ---- 6. Chunked writeBatch commit ----
-  const txCol = collection(firestoreDb, 'managements', mgmtId, 'transactions');
+  // ---- 6. Commit through callable (idempotent per tx.id) ----
+  const createExpense = httpsCallable(functions, 'createExpense');
+  const createPayment = httpsCallable(functions, 'createPayment');
+  let created = 0;
 
   for (let i = 0; i < newTxs.length; i += CHUNK_SIZE) {
     const chunk = newTxs.slice(i, i + CHUNK_SIZE);
-    const batch = writeBatch(firestoreDb);
-
-    for (const tx of chunk) {
-      const { id: txId, ...rest } = tx;
-      // Convert Date to Firestore-safe value
-      const firestoreData: Record<string, unknown> = {
-        ...rest,
-        createdAt: rest.createdAt?.getTime() ?? Date.now()
-      };
-      batch.set(doc(txCol, txId), firestoreData);
-    }
-
-    await batch.commit();
+    const chunkResults = await Promise.all(
+      chunk.map(async (tx) => {
+        const amountMinor = Math.round(Number(tx.amount) * 100);
+        if (!Number.isFinite(amountMinor) || amountMinor <= 0) return false;
+        const reference = tx.type === 'AIDAT_AUTO'
+          ? `${tx.periodYear}-${String((tx.periodMonth ?? 0) + 1).padStart(2, '0')} Aidat Tahakkuku`
+          : `${tx.periodYear}-${String((tx.periodMonth ?? 0) + 1).padStart(2, '0')} Kredi Mahsubu`;
+        if (tx.direction === 'CREDIT' && !tx.unitId) return false;
+        const result = tx.direction === 'CREDIT'
+          ? await createPayment({
+            managementId: mgmtId,
+            unitId: tx.unitId,
+            amountMinor,
+            method: 'auto',
+            reference,
+            idempotencyKey: tx.id,
+            legacyDate: today.toLocaleDateString('tr-TR'),
+            legacyCategoryType: 'GELİR',
+            periodMonth: tx.periodMonth ?? null,
+            periodYear: tx.periodYear ?? null
+          })
+          : await createExpense({
+            managementId: mgmtId,
+            unitId: tx.unitId ?? null,
+            amountMinor,
+            source: 'auto',
+            reference,
+            idempotencyKey: tx.id,
+            legacyDate: today.toLocaleDateString('tr-TR'),
+            legacyCategoryType: 'BORÇLANDIRMA',
+            periodMonth: tx.periodMonth ?? null,
+            periodYear: tx.periodYear ?? null
+          });
+        const data = result.data as { created?: boolean };
+        return data?.created === true;
+      })
+    );
+    created += chunkResults.filter(Boolean).length;
   }
 
-  return { created: newTxs.length };
+  return { created };
 }

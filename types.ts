@@ -102,12 +102,37 @@ export interface LedgerEntry {
   legacyCategoryType?: Transaction['type']; // TODO(ledger-migration): Remove after UI is ledger-native.
   periodMonth?: number;
   periodYear?: number;
+  relatedDueId?: string | null;
+  dueTotalMinor?: number | null;
+  dueAllocatedMinor?: number | null;
+  dueOutstandingMinor?: number | null;
+  dueStatus?: 'open' | 'paid' | null;
+  dueAggregationUpdatedAt?: number | null;
+  dueAggregateVersion?: number | null;
+  appliedMinor?: number | null;
+  unappliedMinor?: number | null;
+  allocationStatus?: 'unapplied' | 'partial' | 'applied' | null;
   metadata?: Record<string, unknown>;
   // Technical processing fields (mutable, NOT domain-immutable)
   balanceAppliedAt?: number | null;
   balanceAppliedVersion?: number | null;
   balanceRevertedAt?: number | null;
   balanceRevertedVersion?: number | null;
+}
+
+export interface DueAllocation {
+  id: string;
+  managementId: string;
+  unitId: string;
+  dueId: string;
+  paymentId: string;
+  paymentEntryId: string;
+  amountMinor: number; // original allocation: >0, reversal allocation: <0
+  status: 'applied';
+  createdAt: number;
+  createdBy: string;
+  idempotencyKey: string;
+  originalAllocationId?: string;
 }
 
 export interface UnitBalance {
@@ -132,6 +157,9 @@ export interface UnitBalance {
   rebuiltBy?: string | null;
   /** Set by rebuildUnitBalance — number of posted entries used in rebuild */
   rebuiltFromEntryCount?: number | null;
+  /** Monotonic counter: incremented by 1 on every trigger-applied cache mutation.
+   *  Used by rebuildUnitBalance to detect concurrent trigger activity. */
+  appliedCount?: number;
 }
 
 export type BalanceDriftAlertStatus = 'open' | 'resolved';
@@ -189,7 +217,15 @@ export type AuditAction =
   | 'DRIFT_DETECTED'
   | 'ALERT_AUTO_RESOLVED'
   | 'AUDIT_WRITE_FAILED'
-  | 'DUES_GENERATED';
+  | 'DUES_GENERATED'
+  | 'PAYMENT_CREATED'
+  | 'PAYMENT_REVERSED'
+  | 'PAYMENT_ALLOCATED'
+  | 'EXPENSE_CREATED'
+  | 'ADJUSTMENT_CREATED'
+  | 'DUE_DRIFT_DETECTED'
+  | 'DUE_AGGREGATES_REBUILT'
+  | 'AUTO_CREDIT_SETTLEMENT';
 
 /**
  * Immutable audit log entry for tracking critical system operations.

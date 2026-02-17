@@ -12,6 +12,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Legacy Guard
+      run: node scripts/guard-no-legacy.mjs
+
+    - name: Firestore Index Guard
+      run: node scripts/verify-firestore-indexes.mjs
     
     - name: Use Node.js 20
       uses: actions/setup-node@v4

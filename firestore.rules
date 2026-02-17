@@ -1,18 +1,203 @@
-rules_version='2'
+rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function userDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function unchanged(field) {
+      return !(field in request.resource.data) || request.resource.data[field] == resource.data[field];
+    }
+
+    function isOwner(mgmtId) {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/managements/$(mgmtId)).data.ownerUid == request.auth.uid;
+    }
+
+    function membershipDoc(mgmtId) {
+      return get(/databases/$(database)/documents/managementMemberships/$(mgmtId)/users/$(request.auth.uid));
+    }
+
+    function isActiveMembership(mgmtId) {
+      let m = membershipDoc(mgmtId);
+      return isSignedIn() && m.exists() && m.data.status == 'active';
+    }
+
+    function membershipRole(mgmtId) {
+      let m = membershipDoc(mgmtId);
+      return m.exists() ? m.data.role : null;
+    }
+
+    function isTenantMember(mgmtId) {
+      return isOwner(mgmtId) || isActiveMembership(mgmtId);
+    }
+
+    function isAdminOrOwner(mgmtId) {
+      let m = membershipDoc(mgmtId);
+      return isOwner(mgmtId) || (
+        isSignedIn() &&
+        m.exists() &&
+        m.data.status == 'active' &&
+        (m.data.role == 'owner' || m.data.role == 'admin')
+      );
+    }
+
+    function isManagerOrAbove(mgmtId) {
+      let m = membershipDoc(mgmtId);
+      return isOwner(mgmtId) || (
+        isSignedIn() &&
+        m.exists() &&
+        m.data.status == 'active' &&
+        (
+          m.data.role == 'owner' ||
+          m.data.role == 'admin' ||
+          m.data.role == 'manager'
+        )
+      );
+    }
+
+    function isViewer(mgmtId) {
+      let m = membershipDoc(mgmtId);
+      return isSignedIn() && m.exists() && m.data.status == 'active' && m.data.role == 'viewer';
+    }
+
+    function ownUnitId() {
+      let u = userDoc();
+      return u.exists() ? u.data.unitId : null;
+    }
+
+    function isViewerOfUnit(mgmtId, unitId) {
+      return isViewer(mgmtId) && ownUnitId() != null && ownUnitId() == unitId;
+    }
+
+    function canReadLedger(mgmtId, unitId) {
+      return isManagerOrAbove(mgmtId) || isViewerOfUnit(mgmtId, unitId);
+    }
+
+    match /users/{uid} {
+      allow read: if isSelf(uid);
+      allow create: if isSelf(uid) &&
+        (!('managementId' in request.resource.data) || request.resource.data.managementId == null) &&
+        (!('unitId' in request.resource.data) || request.resource.data.unitId == null);
+      allow update: if isSelf(uid) &&
+        unchanged('managementId') &&
+        unchanged('unitId') &&
+        unchanged('role');
+      allow delete: if false;
+    }
+
+    match /managementMemberships/{mgmtId}/users/{uid} {
+      allow read: if isSelf(uid) || isAdminOrOwner(mgmtId);
+      allow create, update, delete: if isAdminOrOwner(mgmtId);
+    }
+
+    match /system/{docId} {
+      allow read: if isSignedIn();
+      allow create, update: if isSignedIn();
+      allow delete: if false;
+    }
+
+    match /managements/{mgmtId} {
+      allow create: if isSignedIn() && request.resource.data.ownerUid == request.auth.uid;
+      allow read: if isTenantMember(mgmtId);
+      allow update: if isAdminOrOwner(mgmtId);
+      allow delete: if false;
+
+      match /units/{unitId} {
+        allow read: if isManagerOrAbove(mgmtId) || isViewerOfUnit(mgmtId, unitId);
+        allow create, update, delete: if isAdminOrOwner(mgmtId);
+      }
+
+      match /residents/{residentId} {
+        allow read: if isAdminOrOwner(mgmtId);
+        allow create, update, delete: if isAdminOrOwner(mgmtId);
+      }
+
+      match /boardMembers/{memberId} {
+        allow read: if isManagerOrAbove(mgmtId);
+        allow create, update, delete: if isAdminOrOwner(mgmtId);
+      }
+
+      match /files/{fileId} {
+        allow read: if isManagerOrAbove(mgmtId);
+        allow create, update, delete: if isAdminOrOwner(mgmtId);
+      }
+
+      match /aidatRates/{rateId} {
+        allow read: if isManagerOrAbove(mgmtId);
+        allow create, update, delete: if isAdminOrOwner(mgmtId);
+      }
+
+      match /settings/{settingId} {
+        allow read: if isManagerOrAbove(mgmtId);
+        allow create, update, delete: if isAdminOrOwner(mgmtId);
+      }
+
+      match /invites/{inviteId} {
+        allow read: if false;
+        allow create, update, delete: if isAdminOrOwner(mgmtId);
+      }
+
+      match /ledger/{entryId} {
+        allow read: if canReadLedger(mgmtId, resource.data.unitId) &&
+          resource.data.managementId == mgmtId;
+        allow create, update, delete: if false;
+      }
+
+      match /dueAllocations/{allocationId} {
+        allow read: if canReadLedger(mgmtId, resource.data.unitId) &&
+          resource.data.managementId == mgmtId;
+        allow create, update, delete: if false;
+      }
+
+      match /dueDriftAlerts/{dueId} {
+        allow read: if isAdminOrOwner(mgmtId);
+        allow create, update, delete: if false;
+      }
+
+      match /transactions/{docId} {
+        allow read, write: if false;
+      }
+
+      match /unitBalances/{unitId} {
+        allow read: if isManagerOrAbove(mgmtId) || isViewerOfUnit(mgmtId, unitId);
+        allow create, update, delete: if false;
+      }
+
+      match /auditLogs/{logId} {
+        allow read: if isAdminOrOwner(mgmtId);
+        allow create, update, delete: if false;
+      }
+
+      match /alerts/{alertId} {
+        allow read: if isAdminOrOwner(mgmtId);
+        allow create, update, delete: if false;
+      }
+
+      match /duesRuns/{yearMonth}/{document=**} {
+        allow read: if isAdminOrOwner(mgmtId);
+        allow create, update, delete: if false;
+      }
+
+      match /settleResults/{requestId} {
+        // SaaS idempotency: stores autoSettle results for replay.
+        // Client access blocked — only Admin SDK (Cloud Functions) reads/writes.
+        allow read: if isAdminOrOwner(mgmtId);
+        allow create, update, delete: if false;
+      }
+    }
+
     match /{document=**} {
-      // This rule allows anyone with your database reference to view, edit,
-      // and delete all data in your database. It is useful for getting
-      // started, but it is configured to expire after 30 days because it
-      // leaves your app open to attackers. At that time, all client
-      // requests to your database will be denied.
-      //
-      // Make sure to write security rules for your app before that time, or
-      // else all client requests to your database will be denied until you
-      // update your rules.
-      allow read, write: if request.time < timestamp.date(2026, 3, 19);
+      allow read, write: if false;
     }
   }
 }

@@ -122,21 +122,31 @@ const AidatYonetimiModal: React.FC<AidatYonetimiModalProps> = ({ mgmtId, current
         });
       }
 
-      // Read transactions
-      const txSnap = await getDocs(collection(firestoreDb, 'managements', mgmtId, 'transactions'));
+      // Read existing ledger entries
+      const txSnap = await getDocs(collection(firestoreDb, 'managements', mgmtId, 'ledger'));
       const transactions = txSnap.docs.map(d => {
         const data = d.data();
+        const direction = (data.type === 'CREDIT' || data.direction === 'CREDIT') ? 'CREDIT' : 'DEBIT';
+        const amount = typeof data.amountMinor === 'number'
+          ? Number(data.amountMinor) / 100
+          : (Number(data.amount) || 0);
+        const kind = data.metadata?.kind;
+        const inferredType = d.id.startsWith('aidat_') || kind === 'DUES'
+          ? 'AIDAT_AUTO'
+          : (d.id.startsWith('creditApply_') || kind === 'CREDIT_APPLY'
+            ? 'CREDIT_APPLY'
+            : (data.legacyCategoryType ?? (direction === 'CREDIT' ? 'GELİR' : 'GİDER')));
         return {
           id: d.id,
-          type: data.type ?? '',
-          direction: (data.direction ?? (data.type === 'GELİR' ? 'CREDIT' : 'DEBIT')) as 'DEBIT' | 'CREDIT',
-          amount: Number(data.amount) || 0,
+          type: inferredType,
+          direction: direction as 'DEBIT' | 'CREDIT',
+          amount,
           unitId: data.unitId,
           periodMonth: data.periodMonth,
           periodYear: data.periodYear,
           createdAt: data.createdAt?.toDate?.() ?? undefined
         };
-      });
+      }).filter(tx => tx.type === 'AIDAT_AUTO' || tx.type === 'CREDIT_APPLY');
 
       // Build rates
       let aidatRates: AidatRate[];

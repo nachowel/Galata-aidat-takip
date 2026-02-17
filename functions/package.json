@@ -15,7 +15,14 @@
     "test:balance": "node scripts/test-balance-aggregation.mjs",
     "test:cache-rebuild": "node scripts/test-cache-rebuild.mjs",
     "test:dues-engine": "node scripts/test-dues-engine.mjs",
-    "test:ci": "npm run build && firebase emulators:exec --only firestore,functions,auth \"node scripts/test-balance-aggregation.mjs && node scripts/test-cache-rebuild.mjs && node scripts/test-audit-trail.mjs && node scripts/test-dues-engine.mjs\""
+    "test:role-enforcement": "node scripts/test-role-enforcement.mjs",
+    "test:due-allocation": "node scripts/test-due-allocation.mjs",
+    "test:due-drift-rebuild": "node scripts/test-due-drift-rebuild.mjs",
+    "test:auto-settle-credit": "node scripts/test-auto-settle-from-credit.mjs",
+    "test:function-exports": "node scripts/test-function-exports.mjs",
+    "backfill:memberships": "node scripts/backfill-memberships.mjs",
+    "cleanup:transactions": "node scripts/cleanup-transactions.mjs --all --mode=migrate_and_delete",
+    "test:ci": "npm run build && npm run test:function-exports && firebase emulators:exec --only firestore,functions,auth \"node scripts/test-role-enforcement.mjs && node scripts/test-due-allocation.mjs && node scripts/test-due-drift-rebuild.mjs && node scripts/test-auto-settle-from-credit.mjs && node scripts/test-balance-aggregation.mjs && node scripts/test-cache-rebuild.mjs && node scripts/test-audit-trail.mjs && node scripts/test-dues-engine.mjs\""
   },
   "dependencies": {
     "firebase-admin": "^12.7.0",

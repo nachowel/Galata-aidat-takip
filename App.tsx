@@ -308,18 +308,16 @@ const App: React.FC = () => {
   const handleAddTx = (amt: number, desc: string, type: Transaction['type'], vault: string, date?: string, unitId?: string, m?: number, y?: number) => {
     const formattedDate = date ? (date.includes('-') ? date.split('-').reverse().join('.') : date) : new Date().toLocaleDateString('tr-TR');
     const newTx: Transaction = { id: Math.random().toString(36).slice(2), type, amount: Number(amt), description: `${desc} [${vault}]`, unitId, date: formattedDate, periodMonth: m, periodYear: y };
-    // TODO(ledger-migration): Remove legacy transaction adapter and send ledger-native payload.
-    db.createTransactionFromLegacy(newTx, activeMgmtId ?? undefined).catch((e) => console.error('createTransactionFromLegacy', e));
+    db.createTransaction(newTx, activeMgmtId ?? undefined).catch((e) => console.error('createTransaction', e));
     setActiveSubView('history');
   };
 
   const handleEditTx = async (tx: Transaction) => {
     const mgmtId = activeMgmtId ?? undefined;
     if (!mgmtId) return;
-    // TODO(ledger-migration): Replace with dedicated UI for reversal + corrected entry creation.
-    await db.reverseLedgerEntry(tx.id, 'legacy_edit_adapter', mgmtId);
+    await db.reverseLedgerEntry(tx.id, 'edit_replacement', mgmtId);
     const replacement: Transaction = { ...tx, id: `${tx.id}_edit_${Date.now().toString(36)}` };
-    await db.createTransactionFromLegacy(replacement, mgmtId);
+    await db.createTransaction(replacement, mgmtId);
   };
 
   console.log("RENDER STATE:", { authLoading, currentUser, isAdmin, activeMgmtId });
@@ -382,7 +380,7 @@ const App: React.FC = () => {
           activeSubView === 'iade' ? <IadeView units={unitsWithBalances} info={buildingInfo} onClose={() => setActiveSubView(null)} onSave={(a,d,v,dt,uid) => handleAddTx(a,d,'GİDER',v,dt,uid)} /> :
           activeSubView === 'transfer' ? <TransferView onClose={() => setActiveSubView(null)} onSave={(a,d,v,dt) => handleAddTx(a,d,'TRANSFER',v,dt)} /> :
           activeSubView === 'units' ? <UnitsView isAdmin={isAdmin} units={unitsWithBalances} transactions={transactions} info={buildingInfo} onClose={() => setActiveSubView(null)} onAddUnit={u => setUnits(p => [...p, { ...u, id: Math.random().toString(36).slice(2), credit: 0, debt: 0 }])} onEditUnit={u => setUnits(p => p.map(x => x.id === u.id ? u : x))} onAddFile={(n, c, d) => setFiles(p => [...p, { id: Math.random().toString(36).slice(2), name: n, category: c, date: new Date().toLocaleDateString('tr-TR'), size: '1 MB', extension: 'pdf', data: d }])} onCreateInvite={handleCreateInvite} /> :
-          activeSubView === 'history' ? <TransactionsView isAdmin={isAdmin} transactions={transactions} units={unitsWithBalances} onClose={() => setActiveSubView(null)} onAddFile={() => {}} onDeleteTransaction={id => { db.voidLedgerEntry(id, 'legacy_delete_adapter', activeMgmtId ?? undefined).catch(e => console.error('voidLedgerEntry', e)); }} onUpdateTransaction={tx => { handleEditTx(tx).catch(e => console.error('handleEditTx', e)); }} /> :
+          activeSubView === 'history' ? <TransactionsView isAdmin={isAdmin} transactions={transactions} units={unitsWithBalances} onClose={() => setActiveSubView(null)} onAddFile={() => {}} onDeleteTransaction={id => { db.voidLedgerEntry(id, 'delete_from_history', activeMgmtId ?? undefined).catch(e => console.error('voidLedgerEntry', e)); }} onUpdateTransaction={tx => { handleEditTx(tx).catch(e => console.error('handleEditTx', e)); }} /> :
           activeSubView === 'receivables' ? <ReceivablesView units={unitsWithBalances} onClose={() => setActiveSubView(null)} /> :
           activeSubView === 'aidat-cizelge' ? <AidatCizelgeView units={unitsWithBalances} transactions={transactions} info={buildingInfo} onClose={() => setActiveSubView(null)} onAddDues={() => {}} onAddFile={(n, c, d) => setFiles(p => [...p, { id: Math.random().toString(36).slice(2), name: n, category: c, date: new Date().toLocaleDateString('tr-TR'), size: '1 MB', extension: 'pdf', data: d }])} /> :
           activeSubView === 'monthly-report' ? <MonthlyReportView transactions={transactions} units={unitsWithBalances} onClose={() => setActiveSubView(null)} buildingName={buildingInfo.name} onAddFile={(n, c, d) => setFiles(p => [...p, { id: Math.random().toString(36).slice(2), name: n, category: c, date: new Date().toLocaleDateString('tr-TR'), size: '1 MB', extension: 'pdf', data: d }])} /> :

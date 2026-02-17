@@ -14,8 +14,9 @@ import {
   serverTimestamp,
   Timestamp
 } from 'firebase/firestore';
-import { db as firestoreDb, auth } from './firebaseConfig';
-import { BuildingInfo, Unit, Transaction, LedgerEntry, BoardMember, FileEntry, ManagementMeta } from './types';
+import { httpsCallable } from 'firebase/functions';
+import { db as firestoreDb, auth, functions } from './firebaseConfig';
+import { BuildingInfo, Unit, Transaction, BoardMember, FileEntry, ManagementMeta } from './types';
 
 // Tenant-scoped collection helpers (managements/{mgmtId}/...)
 const unitsCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgmtId, 'units');
@@ -23,6 +24,7 @@ const ledgerCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgm
 const boardMembersCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgmtId, 'boardMembers');
 const filesCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgmtId, 'files');
 const invitesCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgmtId, 'invites');
+type PaymentMethod = 'cash' | 'bank' | 'stripe' | 'auto';
 
 class DatabaseService {
   private activeMgmtId: string = '';
@@ -54,6 +56,12 @@ class DatabaseService {
     console.log("FIRESTORE createManagement PAYLOAD:", firestorePayload);
     const docRef = await addDoc(collection(firestoreDb, 'managements'), firestorePayload);
     if (uid) {
+      await setDoc(doc(firestoreDb, 'managementMemberships', docRef.id, 'users', uid), {
+        role: 'owner',
+        status: 'active',
+        createdAt: Date.now(),
+        updatedAt: Date.now()
+      }, { merge: true });
       await updateDoc(doc(firestoreDb, 'users', uid), {
         managementIds: arrayUnion(docRef.id)
       });
@@ -189,136 +197,328 @@ class DatabaseService {
 
   // --- Ledger (immutable + soft-delete via void/reversal) ---
 
-  private mapLegacyTransactionToLedgerEntry(tx: Transaction, mgmtId: string): LedgerEntry {
-    const type = (tx.direction ?? (tx.type === 'GELİR' ? 'CREDIT' : 'DEBIT')) as 'DEBIT' | 'CREDIT';
-    const amountMinor = Math.round(Number(tx.amount) * 100);
+  private resolveLegacyDirection(tx: Transaction): 'DEBIT' | 'CREDIT' {
+    return (tx.direction ?? (tx.type === 'GELİR' ? 'CREDIT' : 'DEBIT')) as 'DEBIT' | 'CREDIT';
+  }
 
-    return {
-      id: tx.id,
-      managementId: mgmtId,
-      unitId: tx.unitId ?? null,
-      type,
-      amountMinor,
-      currency: 'TRY',
-      source: 'manual',
-      description: tx.description ?? '',
-      status: 'posted',
-      createdAt: Date.now(),
-      createdBy: this.getActorUid(),
-      legacyDate: tx.date ?? '',
-      legacyCategoryType: tx.type,
-      periodMonth: tx.periodMonth,
-      periodYear: tx.periodYear
-    };
+  private inferPaymentMethod(description: string): PaymentMethod {
+    const normalized = description.toLowerCase();
+    if (normalized.includes('[bank]') || normalized.includes('havale') || normalized.includes('eft')) return 'bank';
+    if (normalized.includes('[stripe]') || normalized.includes('kart')) return 'stripe';
+    if (normalized.includes('[auto]') || normalized.includes('otomatik')) return 'auto';
+    return 'cash';
+  }
+
+  private toLegacyDateFromCreatedAt(value: any): string {
+    if (!value) return '';
+    try {
+      if (typeof value?.toDate === 'function') {
+        return value.toDate().toLocaleDateString('tr-TR');
+      }
+      if (typeof value === 'number') {
+        return new Date(value).toLocaleDateString('tr-TR');
+      }
+      if (typeof value?.seconds === 'number') {
+        return new Date(value.seconds * 1000).toLocaleDateString('tr-TR');
+      }
+    } catch {
+      return '';
+    }
+    return '';
   }
 
   private mapLedgerEntryToLegacyTransaction(id: string, data: Record<string, any>): Transaction {
     const amount = Number(data.amountMinor ?? 0) / 100;
-    const direction = data.type as 'DEBIT' | 'CREDIT';
+    const direction = (data.type === 'DEBIT' || data.type === 'CREDIT'
+      ? data.type
+      : (data.direction === 'CREDIT' ? 'CREDIT' : 'DEBIT')) as 'DEBIT' | 'CREDIT';
+    const legacyDate = typeof data.legacyDate === 'string' && data.legacyDate.trim().length > 0
+      ? data.legacyDate
+      : this.toLegacyDateFromCreatedAt(data.createdAt);
 
     return {
       id,
       type: (data.legacyCategoryType ?? (direction === 'CREDIT' ? 'GELİR' : 'GİDER')) as Transaction['type'],
       direction,
       amount: Number.isFinite(amount) ? amount : 0,
-      date: data.legacyDate ?? '',
-      description: data.description ?? '',
+      date: legacyDate,
+      description: data.description ?? data.reference ?? '',
       unitId: data.unitId ?? undefined,
       periodMonth: data.periodMonth,
       periodYear: data.periodYear
     };
   }
 
-  async createLedgerEntry(
-    entry: Omit<LedgerEntry, 'id' | 'managementId' | 'createdAt' | 'createdBy' | 'status'> & {
-      id?: string;
-      managementId?: string;
-      status?: LedgerEntry['status'];
+  async createPayment(
+    payload: {
+      unitId: string;
+      amountMinor: number;
+      method: PaymentMethod;
+      reference: string;
+      idempotencyKey: string;
+      relatedDueId?: string;
+      legacyDate?: string;
+      legacyCategoryType?: Transaction['type'];
+      periodMonth?: number;
+      periodYear?: number;
     },
     mgmtId?: string
   ): Promise<string> {
     const id = mgmtId ?? this.activeMgmtId;
     if (!id) throw new Error('activeMgmtId is not set');
-
-    const entryId = entry.id || doc(ledgerCol(id)).id;
-    await setDoc(doc(ledgerCol(id), entryId), {
-      ...entry,
+    const callable = httpsCallable(functions, 'createPayment');
+    const result = await callable({
       managementId: id,
-      status: entry.status ?? 'posted',
-      createdAt: Date.now(),
-      createdBy: this.getActorUid()
+      unitId: payload.unitId,
+      amountMinor: payload.amountMinor,
+      method: payload.method,
+      reference: payload.reference,
+      idempotencyKey: payload.idempotencyKey,
+      relatedDueId: payload.relatedDueId ?? null,
+      legacyDate: payload.legacyDate ?? null,
+      legacyCategoryType: payload.legacyCategoryType ?? null,
+      periodMonth: payload.periodMonth ?? null,
+      periodYear: payload.periodYear ?? null
     });
-    return entryId;
+    const data = result.data as { entryId?: string };
+    if (!data?.entryId) throw new Error('createPayment: entryId not returned');
+    return data.entryId;
+  }
+
+  async autoSettleFromCredit(
+    payload: { unitId: string },
+    mgmtId?: string
+  ): Promise<{
+    closedDueCount: number;
+    totalSettledMinor: number;
+    remainingCreditMinor: number;
+  }> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id) throw new Error('activeMgmtId is not set');
+    const callable = httpsCallable(functions, 'autoSettleFromCredit');
+    const result = await callable({
+      managementId: id,
+      unitId: payload.unitId
+    });
+    const data = result.data as {
+      closedDueCount?: number;
+      totalSettledMinor?: number;
+      remainingCreditMinor?: number;
+    };
+    return {
+      closedDueCount: Number(data.closedDueCount ?? 0),
+      totalSettledMinor: Number(data.totalSettledMinor ?? 0),
+      remainingCreditMinor: Number(data.remainingCreditMinor ?? 0)
+    };
+  }
+
+  async allocatePaymentToDue(
+    payload: {
+      paymentEntryId: string;
+      dueId: string;
+      amountMinor?: number;
+    },
+    mgmtId?: string
+  ): Promise<{
+    appliedMinor: number;
+    appliedTotalMinor: number;
+    unappliedMinor: number;
+    allocationStatus: 'unapplied' | 'partial' | 'applied';
+    noop: boolean;
+  }> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id) throw new Error('activeMgmtId is not set');
+    const callable = httpsCallable(functions, 'allocatePaymentToDue');
+    const result = await callable({
+      managementId: id,
+      paymentEntryId: payload.paymentEntryId,
+      dueId: payload.dueId,
+      amountMinor: payload.amountMinor ?? null
+    });
+    const data = result.data as {
+      appliedMinor?: number;
+      appliedTotalMinor?: number;
+      unappliedMinor?: number;
+      allocationStatus?: 'unapplied' | 'partial' | 'applied';
+      noop?: boolean;
+    };
+    return {
+      appliedMinor: Number(data.appliedMinor ?? 0),
+      appliedTotalMinor: Number(data.appliedTotalMinor ?? 0),
+      unappliedMinor: Number(data.unappliedMinor ?? 0),
+      allocationStatus: (data.allocationStatus ?? 'unapplied'),
+      noop: Boolean(data.noop)
+    };
+  }
+
+  async createExpense(
+    payload: {
+      unitId?: string;
+      amountMinor: number;
+      source?: string;
+      reference: string;
+      idempotencyKey: string;
+      legacyDate?: string;
+      legacyCategoryType?: Transaction['type'];
+      periodMonth?: number;
+      periodYear?: number;
+    },
+    mgmtId?: string
+  ): Promise<string> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id) throw new Error('activeMgmtId is not set');
+    const callable = httpsCallable(functions, 'createExpense');
+    const result = await callable({
+      managementId: id,
+      unitId: payload.unitId ?? null,
+      amountMinor: payload.amountMinor,
+      source: payload.source ?? 'manual',
+      reference: payload.reference,
+      idempotencyKey: payload.idempotencyKey,
+      legacyDate: payload.legacyDate ?? null,
+      legacyCategoryType: payload.legacyCategoryType ?? null,
+      periodMonth: payload.periodMonth ?? null,
+      periodYear: payload.periodYear ?? null
+    });
+    const data = result.data as { entryId?: string };
+    if (!data?.entryId) throw new Error('createExpense: entryId not returned');
+    return data.entryId;
+  }
+
+  async createAdjustment(
+    payload: {
+      entryType: 'DEBIT' | 'CREDIT';
+      unitId?: string;
+      amountMinor: number;
+      source?: string;
+      reference: string;
+      idempotencyKey: string;
+      legacyDate?: string;
+      legacyCategoryType?: Transaction['type'];
+      periodMonth?: number;
+      periodYear?: number;
+    },
+    mgmtId?: string
+  ): Promise<string> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id) throw new Error('activeMgmtId is not set');
+    const callable = httpsCallable(functions, 'createAdjustment');
+    const result = await callable({
+      managementId: id,
+      entryType: payload.entryType,
+      unitId: payload.unitId ?? null,
+      amountMinor: payload.amountMinor,
+      source: payload.source ?? 'manual',
+      reference: payload.reference,
+      idempotencyKey: payload.idempotencyKey,
+      legacyDate: payload.legacyDate ?? null,
+      legacyCategoryType: payload.legacyCategoryType ?? null,
+      periodMonth: payload.periodMonth ?? null,
+      periodYear: payload.periodYear ?? null
+    });
+    const data = result.data as { entryId?: string };
+    if (!data?.entryId) throw new Error('createAdjustment: entryId not returned');
+    return data.entryId;
   }
 
   async voidLedgerEntry(entryId: string, reason: string, mgmtId?: string): Promise<void> {
     const id = mgmtId ?? this.activeMgmtId;
     if (!id || !entryId) return;
-    await updateDoc(doc(ledgerCol(id), entryId), {
-      status: 'voided',
-      voidReason: reason,
-      voidedAt: Date.now(),
-      voidedBy: this.getActorUid()
-    });
+    const callable = httpsCallable(functions, 'voidLedgerEntry');
+    await callable({ mgmtId: id, entryId, reason });
   }
 
   async reverseLedgerEntry(entryId: string, reason: string, mgmtId?: string): Promise<string> {
     const id = mgmtId ?? this.activeMgmtId;
     if (!id || !entryId) throw new Error('activeMgmtId or entryId is not set');
 
-    const originalSnap = await getDoc(doc(ledgerCol(id), entryId));
-    if (!originalSnap.exists()) throw new Error('ledger entry not found');
-    const original = originalSnap.data() as LedgerEntry;
-    if (original.status === 'voided') throw new Error('voided ledger entry cannot be reversed');
-    if (original.status === 'reversed') throw new Error('ledger entry already reversed');
+    const snap = await getDoc(doc(firestoreDb, 'managements', id, 'ledger', entryId));
+    const entry = snap.exists() ? snap.data() as Record<string, any> : null;
+    const source = typeof entry?.source === 'string' ? entry.source : '';
+    const isPaymentSource = source === 'cash' || source === 'bank' || source === 'stripe' || source === 'auto';
+    const isPaymentEntry = entryId.startsWith('payment_') || (entry?.type === 'CREDIT' && isPaymentSource);
+    if (isPaymentEntry) {
+      return this.reversePayment(entryId, reason, id);
+    }
+    const callable = httpsCallable(functions, 'reverseLedgerEntry');
+    const result = await callable({ mgmtId: id, entryId, reason });
+    const data = result.data as { reversalEntryId?: string };
+    if (!data?.reversalEntryId) throw new Error('reverseLedgerEntry: reversalEntryId not returned');
+    return data.reversalEntryId;
+  }
 
-    const reverseId = doc(ledgerCol(id)).id;
-    await setDoc(doc(ledgerCol(id), reverseId), {
+  async reversePayment(paymentEntryId: string, reason: string, mgmtId?: string): Promise<string> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id || !paymentEntryId) throw new Error('activeMgmtId or paymentEntryId is not set');
+    const callable = httpsCallable(functions, 'reversePayment');
+    const result = await callable({ managementId: id, paymentEntryId, reason });
+    const data = result.data as { reversalEntryId?: string };
+    if (!data?.reversalEntryId) throw new Error('reversePayment: reversalEntryId not returned');
+    return data.reversalEntryId;
+  }
+
+  async checkDueDrift(
+    payload: { sampleLimit?: number } = {},
+    mgmtId?: string
+  ): Promise<{ checked: number; drifted: number; alertsWritten: number; dueIds: string[] }> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id) throw new Error('activeMgmtId is not set');
+    const callable = httpsCallable(functions, 'checkDueDrift');
+    const result = await callable({
       managementId: id,
-      unitId: original.unitId ?? null,
-      type: original.type === 'CREDIT' ? 'DEBIT' : 'CREDIT',
-      amountMinor: Number(original.amountMinor),
-      currency: original.currency ?? 'TRY',
-      source: 'reversal',
-      description: `REVERSAL: ${reason}`,
-      reversalOf: entryId,
-      status: 'posted',
-      createdAt: Date.now(),
-      createdBy: this.getActorUid(),
-      legacyDate: original.legacyDate ?? '',
-      legacyCategoryType: original.legacyCategoryType ?? undefined,
-      periodMonth: original.periodMonth,
-      periodYear: original.periodYear
-    } satisfies Omit<LedgerEntry, 'id'>);
-
-    await updateDoc(doc(ledgerCol(id), entryId), {
-      status: 'reversed',
-      reversedAt: Date.now(),
-      reversedBy: this.getActorUid()
+      sampleLimit: payload.sampleLimit ?? 5
     });
+    const data = result.data as {
+      checked?: number;
+      drifted?: number;
+      alertsWritten?: number;
+      dueIds?: string[];
+    };
+    return {
+      checked: Number(data.checked ?? 0),
+      drifted: Number(data.drifted ?? 0),
+      alertsWritten: Number(data.alertsWritten ?? 0),
+      dueIds: Array.isArray(data.dueIds) ? data.dueIds : []
+    };
+  }
 
-    return reverseId;
+  async rebuildDueAggregates(
+    dueId: string,
+    mgmtId?: string
+  ): Promise<{
+    dueAllocatedMinor: number;
+    dueOutstandingMinor: number;
+    dueStatus: 'open' | 'paid';
+    noop: boolean;
+  }> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id || !dueId) throw new Error('activeMgmtId or dueId is not set');
+    const callable = httpsCallable(functions, 'rebuildDueAggregates');
+    const result = await callable({ managementId: id, dueId });
+    const data = result.data as {
+      dueAllocatedMinor?: number;
+      dueOutstandingMinor?: number;
+      dueStatus?: 'open' | 'paid';
+      noop?: boolean;
+    };
+    return {
+      dueAllocatedMinor: Number(data.dueAllocatedMinor ?? 0),
+      dueOutstandingMinor: Number(data.dueOutstandingMinor ?? 0),
+      dueStatus: data.dueStatus === 'paid' ? 'paid' : 'open',
+      noop: Boolean(data.noop)
+    };
   }
 
   async archiveAllLedgerEntries(mgmtId?: string): Promise<void> {
     const id = mgmtId ?? this.activeMgmtId;
     if (!id) return;
     const snapshot = await getDocs(ledgerCol(id));
-    const batch = writeBatch(firestoreDb);
-    const now = Date.now();
-    const actor = this.getActorUid();
-    snapshot.docs.forEach((d) => {
+    for (const d of snapshot.docs) {
       const data = d.data();
-      if (data.status !== 'voided') {
-        batch.update(d.ref, {
-          status: 'voided',
-          voidReason: 'bulk_archive',
-          voidedAt: now,
-          voidedBy: actor
-        });
+      if (data.status === 'posted') {
+        await this.voidLedgerEntry(d.id, 'bulk_archive', id);
       }
-    });
-    await batch.commit();
+    }
   }
 
   subscribeLedgerEntries(mgmtId: string, callback: (txs: Transaction[]) => void): () => void {
@@ -350,12 +550,55 @@ class DatabaseService {
     });
   }
 
-  // TODO(ledger-migration): Remove after UI is migrated to ledger-native payloads.
-  async createTransactionFromLegacy(tx: Transaction, mgmtId?: string): Promise<string> {
+  async createTransaction(tx: Transaction, mgmtId?: string): Promise<string> {
     const id = mgmtId ?? this.activeMgmtId;
     if (!id) throw new Error('activeMgmtId is not set');
-    const entry = this.mapLegacyTransactionToLedgerEntry(tx, id);
-    return this.createLedgerEntry(entry, id);
+    const direction = this.resolveLegacyDirection(tx);
+    const amountMinor = Math.round(Number(tx.amount) * 100);
+    if (!Number.isFinite(amountMinor) || amountMinor <= 0) {
+      throw new Error('createTransaction: invalid amount');
+    }
+
+    if (tx.type === 'GELİR' && direction === 'CREDIT' && tx.unitId) {
+      return this.createPayment({
+        unitId: tx.unitId,
+        amountMinor,
+        method: this.inferPaymentMethod(tx.description ?? ''),
+        reference: tx.description ?? 'TAHSILAT',
+        idempotencyKey: tx.id,
+        legacyDate: tx.date ?? '',
+        legacyCategoryType: tx.type,
+        periodMonth: tx.periodMonth,
+        periodYear: tx.periodYear
+      }, id);
+    }
+
+    if (direction === 'CREDIT') {
+      return this.createAdjustment({
+        entryType: 'CREDIT',
+        unitId: tx.unitId,
+        amountMinor,
+        source: 'manual',
+        reference: tx.description ?? '',
+        idempotencyKey: tx.id,
+        legacyDate: tx.date ?? '',
+        legacyCategoryType: tx.type,
+        periodMonth: tx.periodMonth,
+        periodYear: tx.periodYear
+      }, id);
+    }
+
+    return this.createExpense({
+      unitId: tx.unitId,
+      amountMinor,
+      source: 'manual',
+      reference: tx.description ?? '',
+      idempotencyKey: tx.id,
+      legacyDate: tx.date ?? '',
+      legacyCategoryType: tx.type,
+      periodMonth: tx.periodMonth,
+      periodYear: tx.periodYear
+    }, id);
   }
 
   // --- Board members (subcollection) ---
@@ -462,12 +705,13 @@ class DatabaseService {
     const id = this.activeMgmtId;
     if (!id) return;
     const batch = writeBatch(firestoreDb);
-    const collections = [unitsCol(id), ledgerCol(id), boardMembersCol(id), filesCol(id)];
+    const collections = [unitsCol(id), boardMembersCol(id), filesCol(id)];
     for (const col of collections) {
       const snap = await getDocs(col);
       snap.docs.forEach(d => batch.delete(d.ref));
     }
     await batch.commit();
+    await this.archiveAllLedgerEntries(id);
   }
 }
 
