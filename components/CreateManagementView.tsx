@@ -43,14 +43,11 @@ const CreateManagementView: React.FC<CreateManagementViewProps> = ({ onClose, on
     await new Promise(r => setTimeout(r, 1200));
     
     const fullName = `${toTitleCase(formData.name.trim())} ${mgmtType}`;
-    
-    setIsSubmitting(false);
-    setIsDone(true);
-    await new Promise(r => setTimeout(r, 800));
-    
-    onSuccess({
+    const managerName = formData.managerName.trim() ? toTitleCase(formData.managerName.trim()) : "";
+
+    const payload = {
       name: fullName,
-      managerName: toTitleCase(formData.managerName.trim()) || "Yönetici Atanmadı",
+      managerName,
       address: formData.address,
       taxNo: formData.taxNo,
       role: "Yönetici",
@@ -58,7 +55,15 @@ const CreateManagementView: React.FC<CreateManagementViewProps> = ({ onClose, on
       isManagerExempt: false,
       isAutoDuesEnabled: true,
       managerUnitId: "",
-    });
+    };
+
+    console.log("CREATE MANAGEMENT DATA:", payload);
+
+    setIsSubmitting(false);
+    setIsDone(true);
+    await new Promise(r => setTimeout(r, 800));
+
+    onSuccess(payload);
   };
 
   if (isDone) return (

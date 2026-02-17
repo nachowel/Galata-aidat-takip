@@ -1,0 +1,30 @@
+{
+  "name": "galata-aidat-takip-functions",
+  "private": true,
+  "main": "lib/index.js",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "clean": "rimraf lib",
+    "lint": "echo \"No lint configured\"",
+    "serve": "firebase emulators:start --only auth,firestore,functions",
+    "deploy": "firebase deploy --only functions",
+    "test:invite-flow": "node scripts/test-invite-flow.mjs",
+    "test:balance": "node scripts/test-balance-aggregation.mjs",
+    "test:cache-rebuild": "node scripts/test-cache-rebuild.mjs",
+    "test:dues-engine": "node scripts/test-dues-engine.mjs",
+    "test:ci": "npm run build && firebase emulators:exec --only firestore,functions,auth \"node scripts/test-balance-aggregation.mjs && node scripts/test-cache-rebuild.mjs && node scripts/test-audit-trail.mjs && node scripts/test-dues-engine.mjs\""
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0",
+    "firebase-functions": "^5.1.1"
+  },
+  "devDependencies": {
+    "firebase": "^12.9.0",
+    "firebase-tools": "^14.6.0",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.8.2"
+  }
+}

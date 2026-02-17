@@ -12,6 +12,14 @@ dist
 dist-ssr
 *.local
 
+# Environment / secrets
+.env
+.env.*
+
+# Firebase
+functions/lib/
+functions/node_modules/
+
 # Claude Code
 .claude/
 

@@ -22,19 +22,20 @@ import YearlyReportView from './components/YearlyReportView.tsx';
 import BoardView from './components/BoardView.tsx';
 import SessionsView from './components/SessionsView.tsx';
 import LoginView from './components/LoginView.tsx';
+import RegisterView from './components/RegisterView.tsx';
 import FilesView from './components/FilesView.tsx';
 import MenuView from './components/MenuView.tsx';
 import MemberRegistrationView from './components/MemberRegistrationView.tsx';
 import ExitView from './components/ExitView.tsx';
-import { BuildingInfo, ActiveTab, Transaction, Unit, BoardMember, FileEntry, BalanceSummary } from './types.ts';
+import { BuildingInfo, ActiveTab, Transaction, Unit, BoardMember, FileEntry, BalanceSummary, AppUser } from './types.ts';
+import { calculateUnitBalance } from './services/ledgerService.ts';
+import type { LedgerTransaction } from './services/ledgerService.ts';
 import { db } from './databaseService.ts';
+import { auth, db as firestoreDb, onAuthStateChanged, logoutUser } from './firebaseConfig.ts';
+import { doc, getDoc } from 'firebase/firestore';
 import { useBackButton } from './useBackButton.ts';
 
-const ACTIVE_MGMT_ID_KEY = 'galata_v16_active_mgmt_id';
-
 const STORAGE_KEYS = {
-  AUTH: 'galata_v16_auth',
-  ROLE: 'galata_v16_role',
   EXITED: 'galata_v16_is_exited'
 };
 
@@ -51,21 +52,21 @@ const DEFAULT_BUILDING_INFO: BuildingInfo = {
 };
 
 const App: React.FC = () => {
+  const [authLoading, setAuthLoading] = useState(true);
+  const [mgmtLoading, setMgmtLoading] = useState(true);
+  const [currentUser, setCurrentUser] = useState<AppUser | null>(null);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [showRegister, setShowRegister] = useState(() => window.location.pathname === '/register');
+
   const [isExited, setIsExited] = useState(() => sessionStorage.getItem(STORAGE_KEYS.EXITED) === 'true');
-  const [isAuthenticated, setIsAuthenticated] = useState(() =>
-    localStorage.getItem(STORAGE_KEYS.AUTH) === 'true' || sessionStorage.getItem(STORAGE_KEYS.AUTH) === 'true'
-  );
-  const [isAdmin, setIsAdmin] = useState(() => localStorage.getItem(STORAGE_KEYS.ROLE) === 'admin');
   const [activeTab, setActiveTab] = useState<ActiveTab>('home');
   const [activeSubView, setActiveSubView] = useState<string | null>(null);
-  // Geri tuşu handler
   useBackButton(activeTab, activeSubView, setActiveTab, setActiveSubView);
 
-
   const [managements, setManagements] = useState<{ id: string; name: string }[]>([]);
-  const [activeMgmtId, setActiveMgmtId] = useState<string>(() => localStorage.getItem(ACTIVE_MGMT_ID_KEY) || '');
+  const [activeMgmtId, setActiveMgmtId] = useState<string | null>(null);
 
-  const loadedIdRef = useRef<string>(activeMgmtId);
+  const loadedIdRef = useRef<string>('');
 
   const [buildingInfo, setBuildingInfo] = useState<BuildingInfo>(DEFAULT_BUILDING_INFO);
   const [units, setUnits] = useState<Unit[]>([]);
@@ -73,22 +74,84 @@ const App: React.FC = () => {
   const [boardMembers, setBoardMembers] = useState<BoardMember[]>([]);
   const [files, setFiles] = useState<FileEntry[]>([]);
 
-  // Firestore: Kullanıcıya ait yönetim listesini yükle; activeMgmtId yoksa ilkini seç
+  // Firebase Auth global listener
   useEffect(() => {
-    if (!isAuthenticated) return;
-    db.getUserManagements().then((list) => {
-      setManagements(list.map((m) => ({ id: m.id, name: m.name ?? '' })));
-      setActiveMgmtId((prev) => {
-        const ids = list.map((m) => m.id);
-        if (!prev || !ids.includes(prev)) return list[0]?.id ?? '';
-        return prev;
-      });
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (user) {
+        try {
+          const docRef = doc(firestoreDb, 'users', user.uid);
+          const docSnap = await getDoc(docRef);
+
+          console.log("AUTH USER UID:", user?.uid);
+          if (docSnap.exists()) {
+            const data = docSnap.data();
+            console.log("FIRESTORE DATA:", data);
+            console.log("ROLE:", data?.role);
+            setCurrentUser({
+              uid: user.uid,
+              email: data.email,
+              role: data.role,
+              managementIds: data.managementIds || [],
+              managementId: data.managementId ?? null,
+              unitId: data.unitId ?? null
+            });
+            setIsAdmin(data.role === 'admin');
+            setIsExited(false);
+            sessionStorage.removeItem(STORAGE_KEYS.EXITED);
+          } else {
+            console.error('User doc bulunamadı:', user.uid);
+            setCurrentUser(null);
+            setIsAdmin(false);
+          }
+        } catch (err) {
+          console.error('User doc okunamadı:', err);
+          setCurrentUser(null);
+          setIsAdmin(false);
+        }
+      } else {
+        setCurrentUser(null);
+        setIsAdmin(false);
+      }
+      setAuthLoading(false);
     });
-  }, [isAuthenticated]);
+    return () => unsubscribe();
+  }, []);
+
+  // Firestore: Kullanıcıya ait yönetim listesini yükle
+  useEffect(() => {
+    if (!currentUser) {
+      setMgmtLoading(false);
+      return;
+    }
+    if (currentUser.role === 'resident' && currentUser.managementId) {
+      setActiveMgmtId(currentUser.managementId);
+      setMgmtLoading(false);
+      return;
+    }
+    const storageKey = `galata_active_mgmt_${currentUser.uid}`;
+    const savedId = localStorage.getItem(storageKey);
+
+    setMgmtLoading(true);
+    db.getUserManagements()
+      .then((list) => {
+        setManagements(list.map((m) => ({ id: m.id, name: m.name ?? '' })));
+        const ids = list.map((m) => m.id);
+        let nextId: string | null;
+        if (list.length === 0) {
+          nextId = null;
+        } else if (savedId && ids.includes(savedId)) {
+          nextId = savedId;
+        } else {
+          nextId = list[0].id;
+        }
+        setActiveMgmtId(nextId);
+      })
+      .finally(() => setMgmtLoading(false));
+  }, [currentUser]);
 
   // activeMgmtId değişince Firestore'dan verileri yükle
   useEffect(() => {
-    if (!activeMgmtId) {
+    if (activeMgmtId === null) {
       setBuildingInfo(DEFAULT_BUILDING_INFO);
       setUnits([]);
       setTransactions([]);
@@ -109,45 +172,52 @@ const App: React.FC = () => {
     Promise.all([
       db.getBuildingInfo(),
       db.getUnits(),
-      db.getTransactions(),
       db.getBoardMembers(),
       db.getFiles()
-    ]).then(([info, u, txs, board, fs]) => {
+    ]).then(([info, u, board, fs]) => {
       setBuildingInfo(info ?? DEFAULT_BUILDING_INFO);
       setUnits(u ?? []);
-      setTransactions(txs ?? []);
       setBoardMembers(board ?? []);
       setFiles(fs ?? []);
       loadedIdRef.current = activeMgmtId;
     });
+
+    // Transactions: realtime onSnapshot listener
+    const unsub = db.subscribeLedgerEntries(activeMgmtId, (txs) => {
+      setTransactions(txs);
+    });
+    return () => unsub();
   }, [activeMgmtId]);
 
-  // Firestore'a kaydet (sadece yüklü olan ID ile eşleşiyorsa)
+  // Firestore'a kaydet
   useEffect(() => {
-    if (!activeMgmtId || activeMgmtId !== loadedIdRef.current) return;
+    if (authLoading) return;
+    if (!currentUser) return;
+    if (activeMgmtId === null) return;
+    if (activeMgmtId !== loadedIdRef.current) return;
 
-    db.saveBuildingInfo(buildingInfo).catch((e) => console.error('saveBuildingInfo', e));
-    db.saveUnits(units).catch((e) => console.error('saveUnits', e));
-    db.saveTransactions(transactions).catch((e) => console.error('saveTransactions', e));
-    db.saveBoardMembers(boardMembers).catch((e) => console.error('saveBoardMembers', e));
-    db.saveFiles(files).catch((e) => console.error('saveFiles', e));
+    db.saveBuildingInfo(buildingInfo, activeMgmtId).catch((e) => console.error('saveBuildingInfo', e));
+    db.saveUnits(units, activeMgmtId).catch((e) => console.error('saveUnits', e));
+    db.saveBoardMembers(boardMembers, activeMgmtId).catch((e) => console.error('saveBoardMembers', e));
+    db.saveFiles(files, activeMgmtId).catch((e) => console.error('saveFiles', e));
 
     if (buildingInfo.name !== DEFAULT_BUILDING_INFO.name) {
       setManagements((prev) => prev.map((m) => (m.id === activeMgmtId ? { ...m, name: buildingInfo.name } : m)));
     }
-  }, [buildingInfo, units, transactions, boardMembers, files, activeMgmtId]);
+  }, [authLoading, currentUser, buildingInfo, units, boardMembers, files, activeMgmtId]);
 
+  // activeMgmtId değişince uid-bazlı localStorage'a yaz
   useEffect(() => {
-    localStorage.setItem(ACTIVE_MGMT_ID_KEY, activeMgmtId);
-  }, [activeMgmtId]);
+    if (currentUser?.uid && activeMgmtId !== null) {
+      localStorage.setItem(`galata_active_mgmt_${currentUser.uid}`, activeMgmtId);
+    }
+  }, [activeMgmtId, currentUser]);
 
   // --- Management Lifecycle Handlers ---
 
   const handleSwitchMgmt = (id: string) => {
-    // Geçiş anında kaydetmeyi durdurmak için ref'i hemen sıfırla
     loadedIdRef.current = 'switching';
     db.switchManagement(id);
-    console.log('🔀 Oturum değiştirildi:', id);
     setActiveMgmtId(id);
     setActiveTab('home');
     setActiveSubView(null);
@@ -161,7 +231,6 @@ const App: React.FC = () => {
       db.setCurrentSession(newId);
       const buildingData: BuildingInfo = { ...DEFAULT_BUILDING_INFO, ...data };
       await db.saveBuildingInfo(buildingData);
-      console.log('✅ Yeni yönetim Firestore\'a kaydedildi:', newId);
 
       setManagements((prev) => [...prev, newMgmt]);
       setBuildingInfo(buildingData);
@@ -172,68 +241,134 @@ const App: React.FC = () => {
     }
   };
 
+  const handleCreateInvite = async (unitId: string) => {
+    if (!activeMgmtId) throw new Error('activeMgmtId is not set');
+    const inviteId = await db.createInvite(activeMgmtId, unitId);
+    return `${window.location.origin}/register?mgmtId=${encodeURIComponent(activeMgmtId)}&inviteId=${encodeURIComponent(inviteId)}`;
+  };
+
   const handleDeleteMgmt = async (id: string) => {
-    await db.deleteManagement(id);
+    await db.archiveManagement(id, 'ui_archive_request');
     setManagements((prev) => prev.filter((m) => m.id !== id));
     if (activeMgmtId === id) {
       loadedIdRef.current = '';
-      setActiveMgmtId('');
+      setActiveMgmtId(null);
     }
   };
 
+  const handleLogout = async () => {
+    await logoutUser();
+    sessionStorage.setItem(STORAGE_KEYS.EXITED, 'true');
+    setIsExited(true);
+  };
+
+  const exemptUnitId = (buildingInfo?.isManagerExempt && buildingInfo?.managerUnitId) ? buildingInfo.managerUnitId : undefined;
+
   const unitsWithBalances = useMemo(() => {
-    const now = new Date();
-    const currentMonthIdx = now.getMonth();
-    const currentYear = now.getFullYear();
-    const duesValue = Number(buildingInfo?.duesAmount) || 0;
+    // Map Transaction[] → LedgerTransaction[]
+    // Use persisted direction when available (ledger-generated txs),
+    // fall back to type-based mapping for legacy/UI-created txs.
+    const ledgerTxs: LedgerTransaction[] = transactions.map(tx => ({
+      id: tx.id,
+      type: tx.type,
+      direction: (tx.direction ?? (tx.type === 'GELİR' ? 'CREDIT' : 'DEBIT')) as 'DEBIT' | 'CREDIT',
+      amount: Number(tx.amount),
+      unitId: tx.unitId,
+      periodMonth: tx.periodMonth,
+      periodYear: tx.periodYear
+    }));
 
     return units.map(unit => {
-      const isExempt = buildingInfo?.isManagerExempt && unit.id === buildingInfo?.managerUnitId;
-      if (isExempt) return { ...unit, credit: 0, debt: 0 };
-      const totalIncome = transactions.filter(tx => tx.unitId === unit.id && tx.type === 'GELİR').reduce((s, tx) => s + Number(tx.amount), 0);
-      const totalManualDebt = transactions.filter(tx => tx.unitId === unit.id && tx.type === 'BORÇLANDIRMA').reduce((s, tx) => s + Number(tx.amount), 0);
-      let runningCredit = totalIncome - totalManualDebt;
-      let totalDebtAccrued = 0;
-      if (buildingInfo?.isAutoDuesEnabled && duesValue > 0) {
-        for (let m = 0; m <= currentMonthIdx; m++) {
-          const hasManual = transactions.some(tx => tx.unitId === unit.id && tx.type === 'BORÇLANDIRMA' && tx.periodMonth === m && tx.periodYear === currentYear);
-          if (!hasManual) { if (runningCredit >= duesValue) runningCredit -= duesValue; else totalDebtAccrued += duesValue; }
-        }
-      }
-      return { ...unit, credit: Math.max(0, runningCredit), debt: Math.max(0, totalDebtAccrued) };
+      if (unit.id === exemptUnitId) return { ...unit, credit: 0, debt: 0 };
+
+      const balance = calculateUnitBalance(unit.id, ledgerTxs);
+      return { ...unit, credit: Math.max(0, -balance), debt: Math.max(0, balance) };
     });
-  }, [units, transactions, buildingInfo]);
+  }, [units, transactions, exemptUnitId]);
 
   const balance: BalanceSummary = useMemo(() => {
-    const income = transactions.filter(tx => tx.type === 'GELİR' && !tx.description.includes('[demirbas]')).reduce((s, t) => s + Number(t.amount), 0);
-    const expense = transactions.filter(tx => tx.type === 'GİDER' && !tx.description.includes('[demirbas]')).reduce((s, t) => s + Number(t.amount), 0);
-    const demIncome = transactions.filter(tx => tx.type === 'GELİR' && tx.description.includes('[demirbas]')).reduce((s, t) => s + Number(t.amount), 0);
-    const demExpense = transactions.filter(tx => tx.type === 'GİDER' && tx.description.includes('[demirbas]')).reduce((s, t) => s + Number(t.amount), 0);
-    return { mevcutBakiye: income - expense, alacakBakiyesi: unitsWithBalances.reduce((s, u) => s + u.debt, 0), toplam: (income - expense) + unitsWithBalances.reduce((s, u) => s + u.debt, 0), demirbasKasasi: demIncome - demExpense };
+    const isDemirbas = (tx: Transaction) => tx.description.includes('[demirbas]');
+    const isCredit = (tx: Transaction) => tx.direction === 'CREDIT' || (!tx.direction && tx.type === 'GELİR');
+
+    let genCredit = 0, genDebit = 0, demCredit = 0, demDebit = 0;
+    for (const tx of transactions) {
+      const amt = Number(tx.amount);
+      if (isDemirbas(tx)) {
+        if (isCredit(tx)) demCredit += amt; else demDebit += amt;
+      } else {
+        if (isCredit(tx)) genCredit += amt; else genDebit += amt;
+      }
+    }
+
+    const mevcutBakiye = genCredit - genDebit;
+    const alacakBakiyesi = unitsWithBalances.reduce((s, u) => s + u.debt, 0);
+    return { mevcutBakiye, alacakBakiyesi, toplam: mevcutBakiye + alacakBakiyesi, demirbasKasasi: demCredit - demDebit };
   }, [unitsWithBalances, transactions]);
 
   const handleAddTx = (amt: number, desc: string, type: Transaction['type'], vault: string, date?: string, unitId?: string, m?: number, y?: number) => {
     const formattedDate = date ? (date.includes('-') ? date.split('-').reverse().join('.') : date) : new Date().toLocaleDateString('tr-TR');
     const newTx: Transaction = { id: Math.random().toString(36).slice(2), type, amount: Number(amt), description: `${desc} [${vault}]`, unitId, date: formattedDate, periodMonth: m, periodYear: y };
-    setTransactions(p => [newTx, ...p]);
+    // TODO(ledger-migration): Remove legacy transaction adapter and send ledger-native payload.
+    db.createTransactionFromLegacy(newTx, activeMgmtId ?? undefined).catch((e) => console.error('createTransactionFromLegacy', e));
     setActiveSubView('history');
   };
 
-  const handleLogin = (role: 'admin' | 'resident', remember: boolean) => {
-    const s = remember ? localStorage : sessionStorage;
-    s.setItem(STORAGE_KEYS.AUTH, 'true');
-    localStorage.setItem(STORAGE_KEYS.ROLE, role);
-    setIsAdmin(role === 'admin'); setIsAuthenticated(true); setIsExited(false);
-    sessionStorage.removeItem(STORAGE_KEYS.EXITED);
+  const handleEditTx = async (tx: Transaction) => {
+    const mgmtId = activeMgmtId ?? undefined;
+    if (!mgmtId) return;
+    // TODO(ledger-migration): Replace with dedicated UI for reversal + corrected entry creation.
+    await db.reverseLedgerEntry(tx.id, 'legacy_edit_adapter', mgmtId);
+    const replacement: Transaction = { ...tx, id: `${tx.id}_edit_${Date.now().toString(36)}` };
+    await db.createTransactionFromLegacy(replacement, mgmtId);
   };
 
-  const handleLogout = () => {
-    localStorage.removeItem(STORAGE_KEYS.AUTH); sessionStorage.removeItem(STORAGE_KEYS.AUTH);
-    setIsAuthenticated(false); setIsExited(true); sessionStorage.setItem(STORAGE_KEYS.EXITED, 'true');
-  };
+  console.log("RENDER STATE:", { authLoading, currentUser, isAdmin, activeMgmtId });
 
-  if (isExited) return <ExitView onRestart={() => { setIsExited(false); sessionStorage.removeItem(STORAGE_KEYS.EXITED); }} />;
-  if (!isAuthenticated) return <LoginView onLogin={handleLogin} buildingName={buildingInfo?.name} />;
+  if (authLoading || mgmtLoading) {
+    return (
+      <div className="fixed inset-0 bg-[#020617] flex flex-col items-center justify-center gap-4">
+        <div className="w-8 h-8 border-2 border-blue-500 border-t-transparent rounded-full animate-spin" />
+        <span className="text-zinc-500 text-xs uppercase tracking-widest">Yükleniyor...</span>
+      </div>
+    );
+  }
+
+  if (isExited) {
+    return <ExitView onRestart={() => { setIsExited(false); sessionStorage.removeItem(STORAGE_KEYS.EXITED); }} />;
+  }
+
+  if (!currentUser) {
+    if (showRegister) {
+      return <RegisterView onBackToLogin={() => setShowRegister(false)} />;
+    }
+    return <LoginView buildingName={buildingInfo?.name} onShowRegister={() => setShowRegister(true)} />;
+  }
+
+  if (currentUser.role === 'resident' && !currentUser.unitId) {
+    return (
+      <div className="fixed inset-0 bg-[#020617] flex flex-col items-center justify-center gap-4 px-8">
+        <span className="text-white font-black text-lg uppercase tracking-widest text-center">Hesap Eşleştirme Bekleniyor</span>
+        <span className="text-zinc-500 text-xs text-center">Yönetici daveti ile daire eşleştirmesi tamamlandığında giriş yapabilirsiniz.</span>
+        <button onClick={handleLogout} className="text-zinc-600 text-xs underline mt-2">Çıkış Yap</button>
+      </div>
+    );
+  }
+
+  if (isAdmin && activeMgmtId === null) {
+    return (
+      <div className="fixed inset-0 bg-[#020617] flex flex-col items-center justify-center gap-4 px-8">
+        <span className="text-white font-black text-lg uppercase tracking-widest text-center">Henüz Yönetim Tanımlanmadı</span>
+        <span className="text-zinc-500 text-xs text-center">Yeni bir yönetim oluşturmak için aşağıdaki butona tıklayın.</span>
+        <button
+          onClick={() => setActiveTab('sessions')}
+          className="mt-4 px-6 py-3 bg-blue-600 text-white rounded-2xl font-black text-sm uppercase tracking-widest"
+        >
+          Yönetim Oluştur
+        </button>
+        <button onClick={handleLogout} className="text-zinc-600 text-xs underline mt-2">Çıkış Yap</button>
+      </div>
+    );
+  }
 
   return (
     <div className="app-gradient text-white pb-24 max-w-md mx-auto shadow-2xl relative min-h-screen">
@@ -246,8 +381,8 @@ const App: React.FC = () => {
           activeSubView === 'gelir' ? <GelirView onClose={() => setActiveSubView(null)} onSave={(a,d,v,dt) => handleAddTx(a,d,'GELİR',v,dt)} /> :
           activeSubView === 'iade' ? <IadeView units={unitsWithBalances} info={buildingInfo} onClose={() => setActiveSubView(null)} onSave={(a,d,v,dt,uid) => handleAddTx(a,d,'GİDER',v,dt,uid)} /> :
           activeSubView === 'transfer' ? <TransferView onClose={() => setActiveSubView(null)} onSave={(a,d,v,dt) => handleAddTx(a,d,'TRANSFER',v,dt)} /> :
-          activeSubView === 'units' ? <UnitsView isAdmin={isAdmin} units={unitsWithBalances} transactions={transactions} info={buildingInfo} onClose={() => setActiveSubView(null)} onAddUnit={u => setUnits(p => [...p, { ...u, id: Math.random().toString(36).slice(2), credit: 0, debt: 0 }])} onEditUnit={u => setUnits(p => p.map(x => x.id === u.id ? u : x))} onAddFile={(n, c, d) => setFiles(p => [...p, { id: Math.random().toString(36).slice(2), name: n, category: c, date: new Date().toLocaleDateString('tr-TR'), size: '1 MB', extension: 'pdf', data: d }])} /> :
-          activeSubView === 'history' ? <TransactionsView isAdmin={isAdmin} transactions={transactions} units={unitsWithBalances} onClose={() => setActiveSubView(null)} onAddFile={() => {}} onDeleteTransaction={id => setTransactions(p => p.filter(x => x.id !== id))} onUpdateTransaction={tx => setTransactions(p => p.map(x => x.id === tx.id ? tx : x))} /> :
+          activeSubView === 'units' ? <UnitsView isAdmin={isAdmin} units={unitsWithBalances} transactions={transactions} info={buildingInfo} onClose={() => setActiveSubView(null)} onAddUnit={u => setUnits(p => [...p, { ...u, id: Math.random().toString(36).slice(2), credit: 0, debt: 0 }])} onEditUnit={u => setUnits(p => p.map(x => x.id === u.id ? u : x))} onAddFile={(n, c, d) => setFiles(p => [...p, { id: Math.random().toString(36).slice(2), name: n, category: c, date: new Date().toLocaleDateString('tr-TR'), size: '1 MB', extension: 'pdf', data: d }])} onCreateInvite={handleCreateInvite} /> :
+          activeSubView === 'history' ? <TransactionsView isAdmin={isAdmin} transactions={transactions} units={unitsWithBalances} onClose={() => setActiveSubView(null)} onAddFile={() => {}} onDeleteTransaction={id => { db.voidLedgerEntry(id, 'legacy_delete_adapter', activeMgmtId ?? undefined).catch(e => console.error('voidLedgerEntry', e)); }} onUpdateTransaction={tx => { handleEditTx(tx).catch(e => console.error('handleEditTx', e)); }} /> :
           activeSubView === 'receivables' ? <ReceivablesView units={unitsWithBalances} onClose={() => setActiveSubView(null)} /> :
           activeSubView === 'aidat-cizelge' ? <AidatCizelgeView units={unitsWithBalances} transactions={transactions} info={buildingInfo} onClose={() => setActiveSubView(null)} onAddDues={() => {}} onAddFile={(n, c, d) => setFiles(p => [...p, { id: Math.random().toString(36).slice(2), name: n, category: c, date: new Date().toLocaleDateString('tr-TR'), size: '1 MB', extension: 'pdf', data: d }])} /> :
           activeSubView === 'monthly-report' ? <MonthlyReportView transactions={transactions} units={unitsWithBalances} onClose={() => setActiveSubView(null)} buildingName={buildingInfo.name} onAddFile={(n, c, d) => setFiles(p => [...p, { id: Math.random().toString(36).slice(2), name: n, category: c, date: new Date().toLocaleDateString('tr-TR'), size: '1 MB', extension: 'pdf', data: d }])} /> :
@@ -256,7 +391,7 @@ const App: React.FC = () => {
           activeSubView === 'member-registration' ? <MemberRegistrationView onClose={() => setActiveSubView(null)} onSave={u => setUnits(p => [...p, { ...u, id: Math.random().toString(36).slice(2), credit: 0, debt: 0 }])} /> : null
         ) : (
           activeTab === 'menu' ? <MenuView isAdmin={isAdmin} onActionClick={(sv, tab) => { if(tab) setActiveTab(tab); else setActiveSubView(sv); }} /> :
-          activeTab === 'settings' ? <SettingsView buildingInfo={buildingInfo} onUpdateBuildingInfo={setBuildingInfo} units={unitsWithBalances} onResetMoney={() => setTransactions([])} onClearFiles={() => setFiles([])} onDeleteSession={activeMgmtId ? () => handleDeleteMgmt(activeMgmtId) : undefined} /> :
+          activeTab === 'settings' ? <SettingsView buildingInfo={buildingInfo} onUpdateBuildingInfo={setBuildingInfo} units={unitsWithBalances} onResetMoney={() => { db.archiveAllLedgerEntries(activeMgmtId ?? undefined).catch(e => console.error('archiveAllLedgerEntries', e)); }} onClearFiles={() => setFiles([])} onDeleteSession={activeMgmtId ? () => handleDeleteMgmt(activeMgmtId) : undefined} mgmtId={activeMgmtId ?? undefined} /> :
           activeTab === 'home' ? (
             <div className="space-y-2 pt-1 pb-2">
               <SummaryCard balance={balance} />
@@ -265,7 +400,7 @@ const App: React.FC = () => {
               <LastTransaction transaction={transactions[0] || null} />
             </div>
           ) :
-          activeTab === 'sessions' ? <SessionsView buildingInfo={buildingInfo} onUpdateInfo={setBuildingInfo} managements={managements} activeId={activeMgmtId} onClose={() => setActiveTab('home')} onSwitch={handleSwitchMgmt} onCreate={handleCreateMgmt} onDelete={handleDeleteMgmt} /> :
+          activeTab === 'sessions' ? <SessionsView buildingInfo={buildingInfo} onUpdateInfo={setBuildingInfo} managements={managements} activeId={activeMgmtId ?? ''} onClose={() => setActiveTab('home')} onSwitch={handleSwitchMgmt} onCreate={handleCreateMgmt} onDelete={handleDeleteMgmt} /> :
           activeTab === 'files' ? <FilesView files={files} onAddFile={f => setFiles(p => [...p, { ...f, id: Math.random().toString(36).slice(2) }])} onDeleteFile={id => setFiles(p => p.filter(x => x.id !== id))} /> : null
         )}
       </main>

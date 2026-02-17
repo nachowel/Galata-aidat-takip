@@ -1,7 +1,8 @@
 
 import React, { useState } from 'react';
-import { Save, Loader2, X, Check, ChevronRight, Building2, ShieldCheck, ToggleLeft, ToggleRight, User, Home, Trash2, AlertTriangle } from 'lucide-react';
+import { Save, Loader2, X, Check, ChevronRight, Building2, ShieldCheck, ToggleLeft, ToggleRight, User, Home, Trash2, AlertTriangle, Wallet } from 'lucide-react';
 import { BuildingInfo, Unit } from '../types.ts';
+import AidatYonetimiModal from './AidatYonetimiModal.tsx';
 
 interface SettingsViewProps {
   buildingInfo: BuildingInfo;
@@ -10,9 +11,10 @@ interface SettingsViewProps {
   onResetMoney: () => void;
   onClearFiles?: () => void;
   onDeleteSession?: () => void;
+  mgmtId?: string;
 }
 
-const SettingsView: React.FC<SettingsViewProps> = ({ buildingInfo, onUpdateBuildingInfo, units, onResetMoney, onClearFiles, onDeleteSession }) => {
+const SettingsView: React.FC<SettingsViewProps> = ({ buildingInfo, onUpdateBuildingInfo, units, onResetMoney, onClearFiles, onDeleteSession, mgmtId }) => {
   const [st, setSt] = useState({ 
     ...buildingInfo, 
     duesAmount: buildingInfo.duesAmount === 0 ? '' : buildingInfo.duesAmount.toString(),
@@ -20,6 +22,7 @@ const SettingsView: React.FC<SettingsViewProps> = ({ buildingInfo, onUpdateBuild
     name: buildingInfo.name || ''
   });
   const [showUnitModal, setShowUnitModal] = useState(false);
+  const [showAidatModal, setShowAidatModal] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
   const handleSave = async () => {
@@ -176,6 +179,26 @@ const SettingsView: React.FC<SettingsViewProps> = ({ buildingInfo, onUpdateBuild
         </button>
       </section>
 
+      {/* AİDAT YÖNETİMİ */}
+      <section className="bg-emerald-900/10 backdrop-blur-md rounded-[32px] p-5 border border-emerald-500/10 shadow-xl space-y-3">
+        <div className="flex items-center space-x-2 opacity-60 px-1">
+          <Wallet size={16} className="text-emerald-400" />
+          <h2 className="text-[10px] font-black tracking-[0.25em] uppercase text-emerald-200 italic">AİDAT YÖNETİMİ</h2>
+        </div>
+        <p className="text-[9px] font-bold text-zinc-500 uppercase leading-relaxed tracking-tight px-1">
+          Aidat tarifesi geçmişini görüntüleyin, yeni tarife ekleyin ve eksik aidatları otomatik üretin.
+        </p>
+        <button
+          onClick={() => setShowAidatModal(true)}
+          disabled={!mgmtId}
+          className="w-full h-12 bg-emerald-600/80 hover:bg-emerald-500 disabled:opacity-30 rounded-2xl flex items-center justify-center space-x-3 active:scale-95 transition-all shadow-xl shadow-emerald-900/30"
+        >
+          <Wallet size={18} className="text-white" />
+          <span className="font-black text-[11px] tracking-[0.2em] uppercase text-white">AİDAT PANELI</span>
+          <ChevronRight size={16} className="text-white/60" />
+        </button>
+      </section>
+
       {/* VERİ YÖNETİMİ BÖLÜMÜ */}
       <section className="bg-red-900/5 backdrop-blur-md rounded-[40px] p-5 border border-red-500/10 shadow-2xl space-y-3">
         <div className="flex items-center space-x-2.5 opacity-60 px-1">
@@ -246,6 +269,15 @@ const SettingsView: React.FC<SettingsViewProps> = ({ buildingInfo, onUpdateBuild
       <p className="text-center text-[7px] font-black uppercase tracking-[0.5em] text-zinc-800 mt-4">
         GALATA DİJİTAL YÖNETİM SİSTEMİ
       </p>
+
+      {/* Aidat Yönetimi Modal */}
+      {showAidatModal && mgmtId && (
+        <AidatYonetimiModal
+          mgmtId={mgmtId}
+          currentDuesAmount={buildingInfo.duesAmount}
+          onClose={() => setShowAidatModal(false)}
+        />
+      )}
 
       {/* Daire Seçici Modal */}
       {showUnitModal && (

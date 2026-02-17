@@ -25,12 +25,23 @@ const UnitDetailView: React.FC<UnitDetailViewProps> = ({ isAdmin, unit, info, tr
   };
 
   const getMonthStatus = (mIdx: number) => {
-    const hasPayment = transactions.some(tx => 
-      tx.unitId === unit.id && tx.type === 'GELİR' && tx.periodMonth === mIdx && tx.periodYear === currentYear
+    if (mIdx > currentMonthIdx) return 'future';
+
+    const monthTxs = transactions.filter(tx =>
+      tx.unitId === unit.id && tx.periodMonth === mIdx && tx.periodYear === currentYear
     );
-    if (hasPayment) return 'paid';
-    if (mIdx <= currentMonthIdx) return 'unpaid';
-    return 'future';
+
+    const expectedDebit = monthTxs
+      .filter(tx => tx.direction === 'DEBIT' || (!tx.direction && tx.type !== 'GELİR'))
+      .reduce((s, tx) => s + Number(tx.amount), 0);
+
+    if (expectedDebit === 0) return 'unpaid';
+
+    const collectedCredit = monthTxs
+      .filter(tx => tx.direction === 'CREDIT' || (!tx.direction && tx.type === 'GELİR'))
+      .reduce((s, tx) => s + Number(tx.amount), 0);
+
+    return collectedCredit >= expectedDebit ? 'paid' : 'unpaid';
   };
 
   const handleSave = () => {
@@ -40,17 +51,24 @@ const UnitDetailView: React.FC<UnitDetailViewProps> = ({ isAdmin, unit, info, tr
 
   const financialData = useMemo(() => {
     const unitTxs = transactions.filter(tx => tx.unitId === unit.id);
-    const genIncome = unitTxs.filter(tx => tx.type === 'GELİR' && !tx.description.toLowerCase().includes('demirbaş')).reduce((s, t) => s + t.amount, 0);
-    const demIncome = unitTxs.filter(tx => tx.type === 'GELİR' && tx.description.toLowerCase().includes('demirbaş')).reduce((s, t) => s + t.amount, 0);
-    const genDebt = unitTxs.filter(tx => tx.type === 'BORÇLANDIRMA' && !tx.description.toLowerCase().includes('demirbaş')).reduce((s, t) => s + t.amount, 0);
-    const demDebt = unitTxs.filter(tx => tx.type === 'BORÇLANDIRMA' && tx.description.toLowerCase().includes('demirbaş')).reduce((s, t) => s + t.amount, 0);
-    const autoDues = (currentMonthIdx + 1) * (info.duesAmount || 0);
-    const totalGenDebt = genDebt + autoDues;
+    const isDemirbas = (tx: Transaction) => tx.description.toLowerCase().includes('demirbaş');
+    const isCredit = (tx: Transaction) => tx.direction === 'CREDIT' || (!tx.direction && tx.type === 'GELİR');
+
+    // Genel vault
+    const genCredit = unitTxs.filter(tx => !isDemirbas(tx) && isCredit(tx)).reduce((s, t) => s + Number(t.amount), 0);
+    const genDebit = unitTxs.filter(tx => !isDemirbas(tx) && !isCredit(tx)).reduce((s, t) => s + Number(t.amount), 0);
+    const genNet = genDebit - genCredit;
+
+    // Demirbaş vault
+    const demCredit = unitTxs.filter(tx => isDemirbas(tx) && isCredit(tx)).reduce((s, t) => s + Number(t.amount), 0);
+    const demDebit = unitTxs.filter(tx => isDemirbas(tx) && !isCredit(tx)).reduce((s, t) => s + Number(t.amount), 0);
+    const demNet = demDebit - demCredit;
+
     return {
-      genel: { kredi: genIncome > totalGenDebt ? genIncome - totalGenDebt : 0, borc: totalGenDebt > genIncome ? totalGenDebt - genIncome : 0 },
-      demirbas: { kredi: demIncome > demDebt ? demIncome - demDebt : 0, borc: demDebt > demIncome ? demDebt - demIncome : 0 }
+      genel: { kredi: Math.max(0, -genNet), borc: Math.max(0, genNet) },
+      demirbas: { kredi: Math.max(0, -demNet), borc: Math.max(0, demNet) }
     };
-  }, [transactions, unit, info, currentMonthIdx]);
+  }, [transactions, unit]);
 
   return (
     <div className="fixed inset-0 z-[300] bg-[#030712] flex flex-col animate-in slide-in-from-bottom duration-500 overflow-y-auto no-scrollbar pb-20">

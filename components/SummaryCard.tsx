@@ -25,8 +25,8 @@ const SummaryCard: React.FC<SummaryCardProps> = ({ balance }) => {
     <div className="px-1 mb-2">
       <div className="bg-[#0f172a] border border-white/5 rounded-[24px] py-3 px-4 shadow-2xl flex items-center">
         {/* Ring Chart Area - Daha küçük */}
-        <div className="w-[65px] h-[65px] shrink-0 relative flex items-center justify-center -ml-[5px] mt-[10px]">
-          <ResponsiveContainer width="100%" height="100%">
+        <div className="w-[65px] h-[65px] shrink-0 relative flex items-center justify-center -ml-[5px] mt-[10px]" style={{ minHeight: 65 }}>
+          <ResponsiveContainer width="100%" height={65}>
             <PieChart>
               <Pie
                 data={chartData}

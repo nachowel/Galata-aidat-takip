@@ -15,9 +15,10 @@ interface UnitsViewProps {
   onAddUnit: (unit: Omit<Unit, 'id' | 'credit' | 'debt'>) => void;
   onEditUnit: (unit: Unit) => void;
   onAddFile: (name: string, category: FileEntry['category'], data?: string) => void;
+  onCreateInvite: (unitId: string) => Promise<string>;
 }
 
-const UnitsView: React.FC<UnitsViewProps> = ({ isAdmin, units, info, transactions, onClose, onAddUnit, onEditUnit, onAddFile }) => {
+const UnitsView: React.FC<UnitsViewProps> = ({ isAdmin, units, info, transactions, onClose, onAddUnit, onEditUnit, onAddFile, onCreateInvite }) => {
   const [showAddModal, setShowAddModal] = useState(false);
   const [selectedUnit, setSelectedUnit] = useState<Unit | null>(null);
   
@@ -35,6 +36,8 @@ const UnitsView: React.FC<UnitsViewProps> = ({ isAdmin, units, info, transaction
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [isProcessingPdf, setIsProcessingPdf] = useState(false);
+  const [inviteLoadingForUnit, setInviteLoadingForUnit] = useState<string | null>(null);
+  const [inviteLink, setInviteLink] = useState('');
 
   const toTitleCase = (str: string) => {
     if (!str) return '';
@@ -118,6 +121,28 @@ const UnitsView: React.FC<UnitsViewProps> = ({ isAdmin, units, info, transaction
     } catch (err) { alert("PDF hatası."); } finally { setIsProcessingPdf(false); }
   };
 
+  const handleCreateInvite = async (unitId: string) => {
+    try {
+      setInviteLoadingForUnit(unitId);
+      const link = await onCreateInvite(unitId);
+      setInviteLink(link);
+    } catch (error) {
+      alert('Davet linki oluşturulamadı.');
+    } finally {
+      setInviteLoadingForUnit(null);
+    }
+  };
+
+  const handleCopyInviteLink = async () => {
+    if (!inviteLink) return;
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+      alert('Davet linki kopyalandı.');
+    } catch {
+      alert(inviteLink);
+    }
+  };
+
   if (selectedUnit) {
     return <UnitDetailView isAdmin={isAdmin} unit={selectedUnit} info={info} transactions={transactions} onClose={() => setSelectedUnit(null)} onUpdate={(u) => { onEditUnit(u); setSelectedUnit(u); }} />;
   }
@@ -158,9 +183,22 @@ const UnitsView: React.FC<UnitsViewProps> = ({ isAdmin, units, info, transaction
                   </div>
                 </div>
               </div>
-              <div className="text-right flex flex-col items-end">
+              <div className="text-right flex flex-col items-end gap-2">
                 <span className="text-[9px] font-black text-white leading-none">₺{formatCurrency(unit.credit)}</span>
                 <span className="text-[9px] font-black text-red-500 mt-1 leading-none">₺{formatCurrency(unit.debt)}</span>
+                {isAdmin && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleCreateInvite(unit.id);
+                    }}
+                    disabled={inviteLoadingForUnit === unit.id}
+                    className="no-print px-2 py-1 rounded-lg bg-blue-600 text-white text-[9px] font-black uppercase tracking-wider disabled:opacity-50"
+                  >
+                    {inviteLoadingForUnit === unit.id ? <Loader2 size={12} className="animate-spin" /> : 'DAVET LINKI OLUSTUR'}
+                  </button>
+                )}
               </div>
             </div>
           ))}
@@ -208,6 +246,26 @@ const UnitsView: React.FC<UnitsViewProps> = ({ isAdmin, units, info, transaction
 
       {isProcessingPdf && (
         <div className="fixed inset-0 z-[5000] bg-black/80 backdrop-blur-xl flex flex-col items-center justify-center animate-in fade-in"><Loader2 className="animate-spin text-blue-500 mb-3" size={40} /><p className="text-[10px] font-black text-white uppercase tracking-widest">Daire Listesi Hazırlanıyor...</p></div>
+      )}
+
+      {inviteLink && (
+        <div className="fixed inset-0 z-[600] bg-black/90 backdrop-blur-md flex items-center justify-center px-6">
+          <div className="bg-[#1e293b] w-full max-w-sm rounded-[24px] p-5 border border-white/10">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-[11px] font-black uppercase tracking-widest text-white">DAVET LINKI</h3>
+              <button onClick={() => setInviteLink('')} className="text-white/40"><X size={20} /></button>
+            </div>
+            <div className="bg-black/30 rounded-xl p-3 border border-white/10 break-all text-[11px] text-zinc-300">
+              {inviteLink}
+            </div>
+            <button
+              onClick={handleCopyInviteLink}
+              className="w-full h-11 mt-4 bg-blue-600 text-white rounded-xl text-[11px] font-black uppercase tracking-widest"
+            >
+              LINKI KOPYALA
+            </button>
+          </div>
+        </div>
       )}
     </>
   );

@@ -6,23 +6,30 @@ import {
   addDoc,
   setDoc,
   updateDoc,
-  deleteDoc,
   query,
   where,
   onSnapshot,
-  writeBatch
+  writeBatch,
+  arrayUnion,
+  serverTimestamp,
+  Timestamp
 } from 'firebase/firestore';
 import { db as firestoreDb, auth } from './firebaseConfig';
-import { BuildingInfo, Unit, Transaction, BoardMember, FileEntry, ManagementMeta } from './types';
+import { BuildingInfo, Unit, Transaction, LedgerEntry, BoardMember, FileEntry, ManagementMeta } from './types';
 
 // Tenant-scoped collection helpers (managements/{mgmtId}/...)
 const unitsCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgmtId, 'units');
-const transactionsCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgmtId, 'transactions');
+const ledgerCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgmtId, 'ledger');
 const boardMembersCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgmtId, 'boardMembers');
 const filesCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgmtId, 'files');
+const invitesCol = (mgmtId: string) => collection(firestoreDb, 'managements', mgmtId, 'invites');
 
 class DatabaseService {
   private activeMgmtId: string = '';
+
+  private getActorUid(): string {
+    return auth.currentUser?.uid ?? 'system';
+  }
 
   setCurrentSession(mgmtId: string): void {
     this.activeMgmtId = mgmtId;
@@ -42,11 +49,15 @@ class DatabaseService {
   // --- Management Lifecycle ---
 
   async createManagement(name: string): Promise<string> {
-    const docRef = await addDoc(collection(firestoreDb, 'managements'), {
-      name,
-      ownerUid: auth.currentUser?.uid ?? null,
-      createdAt: Date.now()
-    });
+    const uid = auth.currentUser?.uid ?? null;
+    const firestorePayload = { name, ownerUid: uid, createdAt: Date.now() };
+    console.log("FIRESTORE createManagement PAYLOAD:", firestorePayload);
+    const docRef = await addDoc(collection(firestoreDb, 'managements'), firestorePayload);
+    if (uid) {
+      await updateDoc(doc(firestoreDb, 'users', uid), {
+        managementIds: arrayUnion(docRef.id)
+      });
+    }
     console.log('✅ Yeni yönetim oluşturuldu:', docRef.id, name);
     return docRef.id;
   }
@@ -65,19 +76,37 @@ class DatabaseService {
     })) as { id: string; name: string; ownerUid?: string; createdAt?: number }[];
   }
 
+  async createInvite(mgmtId: string, unitId: string): Promise<string> {
+    const expiresAt = Timestamp.fromMillis(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const ref = await addDoc(invitesCol(mgmtId), {
+      unitId,
+      status: 'active',
+      createdAt: serverTimestamp(),
+      expiresAt,
+      usedAt: null,
+      usedByUid: null
+    });
+    return ref.id;
+  }
+
   switchManagement(mgmtId: string): void {
     this.activeMgmtId = mgmtId;
     console.log('🔀 Yönetim değiştirildi:', mgmtId);
   }
 
-  async deleteManagement(mgmtId: string): Promise<void> {
+  async archiveManagement(mgmtId: string, reason: string = 'manual_archive'): Promise<void> {
     try {
-      console.log('🗑️ Yönetim siliniyor:', mgmtId);
-      await deleteDoc(doc(firestoreDb, 'managements', mgmtId));
+      console.log('🗂️ Yönetim arşivleniyor:', mgmtId);
+      await updateDoc(doc(firestoreDb, 'managements', mgmtId), {
+        status: 'archived',
+        archivedAt: Date.now(),
+        archivedBy: this.getActorUid(),
+        archiveReason: reason
+      });
       if (this.activeMgmtId === mgmtId) this.activeMgmtId = '';
-      console.log('✓ Yönetim Firestore\'dan silindi:', mgmtId);
+      console.log('✓ Yönetim arşivlendi:', mgmtId);
     } catch (error) {
-      console.error('✗ Yönetim silme hatası:', error);
+      console.error('✗ Yönetim arşivleme hatası:', error);
       throw error;
     }
   }
@@ -100,8 +129,8 @@ class DatabaseService {
 
   // --- Building info (stored in management document) ---
 
-  async saveBuildingInfo(info: BuildingInfo): Promise<void> {
-    const id = this.activeMgmtId;
+  async saveBuildingInfo(info: BuildingInfo, mgmtId?: string): Promise<void> {
+    const id = mgmtId ?? this.activeMgmtId;
     if (!id) throw new Error('activeMgmtId is not set');
     await updateDoc(this.mgmtRef(id), {
       name: info.name,
@@ -137,8 +166,8 @@ class DatabaseService {
 
   // --- Units (subcollection) ---
 
-  async saveUnits(units: Unit[]): Promise<void> {
-    const id = this.activeMgmtId;
+  async saveUnits(units: Unit[], mgmtId?: string): Promise<void> {
+    const id = mgmtId ?? this.activeMgmtId;
     if (!id) throw new Error('activeMgmtId is not set');
     const col = unitsCol(id);
     const batch = writeBatch(firestoreDb);
@@ -158,29 +187,162 @@ class DatabaseService {
     return snapshot.docs.map(d => ({ id: d.id, ...d.data(), credit: 0, debt: 0 })) as Unit[];
   }
 
-  // --- Transactions (subcollection) ---
+  // --- Ledger (immutable + soft-delete via void/reversal) ---
 
-  async saveTransactions(transactions: Transaction[]): Promise<void> {
-    const id = this.activeMgmtId;
+  private mapLegacyTransactionToLedgerEntry(tx: Transaction, mgmtId: string): LedgerEntry {
+    const type = (tx.direction ?? (tx.type === 'GELİR' ? 'CREDIT' : 'DEBIT')) as 'DEBIT' | 'CREDIT';
+    const amountMinor = Math.round(Number(tx.amount) * 100);
+
+    return {
+      id: tx.id,
+      managementId: mgmtId,
+      unitId: tx.unitId ?? null,
+      type,
+      amountMinor,
+      currency: 'TRY',
+      source: 'manual',
+      description: tx.description ?? '',
+      status: 'posted',
+      createdAt: Date.now(),
+      createdBy: this.getActorUid(),
+      legacyDate: tx.date ?? '',
+      legacyCategoryType: tx.type,
+      periodMonth: tx.periodMonth,
+      periodYear: tx.periodYear
+    };
+  }
+
+  private mapLedgerEntryToLegacyTransaction(id: string, data: Record<string, any>): Transaction {
+    const amount = Number(data.amountMinor ?? 0) / 100;
+    const direction = data.type as 'DEBIT' | 'CREDIT';
+
+    return {
+      id,
+      type: (data.legacyCategoryType ?? (direction === 'CREDIT' ? 'GELİR' : 'GİDER')) as Transaction['type'],
+      direction,
+      amount: Number.isFinite(amount) ? amount : 0,
+      date: data.legacyDate ?? '',
+      description: data.description ?? '',
+      unitId: data.unitId ?? undefined,
+      periodMonth: data.periodMonth,
+      periodYear: data.periodYear
+    };
+  }
+
+  async createLedgerEntry(
+    entry: Omit<LedgerEntry, 'id' | 'managementId' | 'createdAt' | 'createdBy' | 'status'> & {
+      id?: string;
+      managementId?: string;
+      status?: LedgerEntry['status'];
+    },
+    mgmtId?: string
+  ): Promise<string> {
+    const id = mgmtId ?? this.activeMgmtId;
     if (!id) throw new Error('activeMgmtId is not set');
-    const col = transactionsCol(id);
+
+    const entryId = entry.id || doc(ledgerCol(id)).id;
+    await setDoc(doc(ledgerCol(id), entryId), {
+      ...entry,
+      managementId: id,
+      status: entry.status ?? 'posted',
+      createdAt: Date.now(),
+      createdBy: this.getActorUid()
+    });
+    return entryId;
+  }
+
+  async voidLedgerEntry(entryId: string, reason: string, mgmtId?: string): Promise<void> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id || !entryId) return;
+    await updateDoc(doc(ledgerCol(id), entryId), {
+      status: 'voided',
+      voidReason: reason,
+      voidedAt: Date.now(),
+      voidedBy: this.getActorUid()
+    });
+  }
+
+  async reverseLedgerEntry(entryId: string, reason: string, mgmtId?: string): Promise<string> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id || !entryId) throw new Error('activeMgmtId or entryId is not set');
+
+    const originalSnap = await getDoc(doc(ledgerCol(id), entryId));
+    if (!originalSnap.exists()) throw new Error('ledger entry not found');
+    const original = originalSnap.data() as LedgerEntry;
+    if (original.status === 'voided') throw new Error('voided ledger entry cannot be reversed');
+    if (original.status === 'reversed') throw new Error('ledger entry already reversed');
+
+    const reverseId = doc(ledgerCol(id)).id;
+    await setDoc(doc(ledgerCol(id), reverseId), {
+      managementId: id,
+      unitId: original.unitId ?? null,
+      type: original.type === 'CREDIT' ? 'DEBIT' : 'CREDIT',
+      amountMinor: Number(original.amountMinor),
+      currency: original.currency ?? 'TRY',
+      source: 'reversal',
+      description: `REVERSAL: ${reason}`,
+      reversalOf: entryId,
+      status: 'posted',
+      createdAt: Date.now(),
+      createdBy: this.getActorUid(),
+      legacyDate: original.legacyDate ?? '',
+      legacyCategoryType: original.legacyCategoryType ?? undefined,
+      periodMonth: original.periodMonth,
+      periodYear: original.periodYear
+    } satisfies Omit<LedgerEntry, 'id'>);
+
+    await updateDoc(doc(ledgerCol(id), entryId), {
+      status: 'reversed',
+      reversedAt: Date.now(),
+      reversedBy: this.getActorUid()
+    });
+
+    return reverseId;
+  }
+
+  async archiveAllLedgerEntries(mgmtId?: string): Promise<void> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id) return;
+    const snapshot = await getDocs(ledgerCol(id));
     const batch = writeBatch(firestoreDb);
-    const existing = await getDocs(col);
-    existing.docs.forEach(d => batch.delete(d.ref));
-    transactions.forEach(tx => {
-      if (tx?.id) {
-        const { id: txId, ...rest } = tx;
-        batch.set(doc(col, txId), rest);
+    const now = Date.now();
+    const actor = this.getActorUid();
+    snapshot.docs.forEach((d) => {
+      const data = d.data();
+      if (data.status !== 'voided') {
+        batch.update(d.ref, {
+          status: 'voided',
+          voidReason: 'bulk_archive',
+          voidedAt: now,
+          voidedBy: actor
+        });
       }
     });
     await batch.commit();
   }
 
-  async getTransactions(): Promise<Transaction[]> {
-    const id = this.activeMgmtId;
+  subscribeLedgerEntries(mgmtId: string, callback: (txs: Transaction[]) => void): () => void {
+    if (!mgmtId) return () => {};
+    return onSnapshot(ledgerCol(mgmtId), (snapshot) => {
+      const list = snapshot.docs
+        .filter((d) => d.data().status !== 'voided')
+        .map((d) => this.mapLedgerEntryToLegacyTransaction(d.id, d.data() as Record<string, any>));
+      list.sort((a, b) => {
+        const dateA = a.date ? a.date.split('.').reverse().join('') : '0';
+        const dateB = b.date ? b.date.split('.').reverse().join('') : '0';
+        return dateB.localeCompare(dateA);
+      });
+      callback(list);
+    });
+  }
+
+  async getLedgerEntries(mgmtId?: string): Promise<Transaction[]> {
+    const id = mgmtId ?? this.activeMgmtId;
     if (!id) return [];
-    const snapshot = await getDocs(transactionsCol(id));
-    const list = snapshot.docs.map(d => ({ id: d.id, ...d.data() })) as Transaction[];
+    const snapshot = await getDocs(ledgerCol(id));
+    const list = snapshot.docs
+      .filter((d) => d.data().status !== 'voided')
+      .map((d) => this.mapLedgerEntryToLegacyTransaction(d.id, d.data() as Record<string, any>));
     return list.sort((a, b) => {
       const dateA = a.date ? a.date.split('.').reverse().join('') : '0';
       const dateB = b.date ? b.date.split('.').reverse().join('') : '0';
@@ -188,15 +350,18 @@ class DatabaseService {
     });
   }
 
-  async deleteTransaction(txId: string): Promise<void> {
-    if (!txId || !this.activeMgmtId) return;
-    await deleteDoc(doc(firestoreDb, 'managements', this.activeMgmtId, 'transactions', txId));
+  // TODO(ledger-migration): Remove after UI is migrated to ledger-native payloads.
+  async createTransactionFromLegacy(tx: Transaction, mgmtId?: string): Promise<string> {
+    const id = mgmtId ?? this.activeMgmtId;
+    if (!id) throw new Error('activeMgmtId is not set');
+    const entry = this.mapLegacyTransactionToLedgerEntry(tx, id);
+    return this.createLedgerEntry(entry, id);
   }
 
   // --- Board members (subcollection) ---
 
-  async saveBoardMembers(members: BoardMember[]): Promise<void> {
-    const id = this.activeMgmtId;
+  async saveBoardMembers(members: BoardMember[], mgmtId?: string): Promise<void> {
+    const id = mgmtId ?? this.activeMgmtId;
     if (!id) throw new Error('activeMgmtId is not set');
     const col = boardMembersCol(id);
     const batch = writeBatch(firestoreDb);
@@ -218,8 +383,8 @@ class DatabaseService {
 
   // --- Files (subcollection) ---
 
-  async saveFiles(files: FileEntry[]): Promise<void> {
-    const id = this.activeMgmtId;
+  async saveFiles(files: FileEntry[], mgmtId?: string): Promise<void> {
+    const id = mgmtId ?? this.activeMgmtId;
     if (!id) throw new Error('activeMgmtId is not set');
     const col = filesCol(id);
     const batch = writeBatch(firestoreDb);
@@ -264,7 +429,7 @@ class DatabaseService {
     }
     const colMap: Record<string, ReturnType<typeof collection>> = {
       units: unitsCol(id),
-      transactions: transactionsCol(id),
+      transactions: ledgerCol(id),
       board_members: boardMembersCol(id),
       files: filesCol(id)
     };
@@ -288,15 +453,16 @@ class DatabaseService {
     }
   }
 
-  async deleteSession(sessionId: string): Promise<void> {
-    await this.deleteManagement(sessionId);
+  async archiveSession(sessionId: string, reason: string = 'session_archive'): Promise<void> {
+    await this.archiveManagement(sessionId, reason);
   }
 
+  // TODO(soft-delete-migration): Replace with archive APIs for each collection.
   async clearAllData(): Promise<void> {
     const id = this.activeMgmtId;
     if (!id) return;
     const batch = writeBatch(firestoreDb);
-    const collections = [unitsCol(id), transactionsCol(id), boardMembersCol(id), filesCol(id)];
+    const collections = [unitsCol(id), ledgerCol(id), boardMembersCol(id), filesCol(id)];
     for (const col of collections) {
       const snap = await getDocs(col);
       snap.docs.forEach(d => batch.delete(d.ref));

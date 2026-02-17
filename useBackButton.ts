@@ -8,27 +8,28 @@ export const useBackButton = (
   setActiveSubView: (view: string | null) => void
 ) => {
   useEffect(() => {
-    const backButtonListener = CapacitorApp.addListener('backButton', () => {
+    let listenerHandle: Awaited<ReturnType<typeof CapacitorApp.addListener>> | null = null;
+
+    CapacitorApp.addListener('backButton', () => {
       console.log('Geri tuşuna basıldı - activeTab:', activeTab, 'activeSubView:', activeSubView);
-      
-      // Eğer bir alt view açıksa, onu kapat
+
       if (activeSubView) {
         setActiveSubView(null);
         return;
       }
-      
-      // Eğer ana sayfa değilse, ana sayfaya dön
+
       if (activeTab !== 'home') {
         setActiveTab('home');
         return;
       }
-      
-      // Ana sayfadaysa, uygulamadan çık
+
       CapacitorApp.exitApp();
+    }).then((handle) => {
+      listenerHandle = handle;
     });
 
     return () => {
-      backButtonListener.remove();
+      listenerHandle?.remove();
     };
   }, [activeTab, activeSubView, setActiveTab, setActiveSubView]);
 };

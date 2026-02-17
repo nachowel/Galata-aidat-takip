@@ -37,55 +37,38 @@ const AidatCizelgeView: React.FC<AidatCizelgeViewProps> = ({ units, transactions
       return 'exempt';
     }
 
-    const totalIncome = transactions
-      .filter(tx => tx.unitId === unit.id && tx.type === 'GELİR')
-      .reduce((sum, tx) => sum + tx.amount, 0);
-    
-    const totalManualDebt = transactions
-      .filter(tx => tx.unitId === unit.id && tx.type === 'BORÇLANDIRMA')
-      .reduce((sum, tx) => sum + (tx.amount || 0), 0);
+    const mIdx = month - 1; // periodMonth is 0-indexed
 
-    let runningCredit = totalIncome - totalManualDebt;
-    const duesValue = info.duesAmount || 0;
+    // Expected debit: AIDAT_AUTO + BORÇLANDIRMA for this unit/month/year
+    const expectedDebit = transactions
+      .filter(tx =>
+        tx.unitId === unit.id &&
+        tx.periodMonth === mIdx &&
+        tx.periodYear === selectedYear &&
+        (tx.direction === 'DEBIT' || (!tx.direction && tx.type !== 'GELİR'))
+      )
+      .reduce((sum, tx) => sum + Number(tx.amount), 0);
 
-    for (let m = 1; m <= 12; m++) {
-      const mIdx = m - 1;
-      
-      const manualTx = transactions.find(tx => 
-        tx.unitId === unit.id && 
-        tx.type === 'BORÇLANDIRMA' && 
-        tx.periodMonth === mIdx && 
-        tx.periodYear === selectedYear
-      );
-      
-      const hasManualDebt = !!manualTx;
-      const shouldHaveAutoDues = info.isAutoDuesEnabled && duesValue > 0;
+    if (expectedDebit === 0) return 'none';
 
-      if (!shouldHaveAutoDues && !hasManualDebt) {
-        if (m === month) return 'none';
-        continue;
-      }
+    // Collected credit: all CREDIT direction txs for this unit/month/year
+    const collectedCredit = transactions
+      .filter(tx =>
+        tx.unitId === unit.id &&
+        tx.periodMonth === mIdx &&
+        tx.periodYear === selectedYear &&
+        (tx.direction === 'CREDIT' || (!tx.direction && tx.type === 'GELİR'))
+      )
+      .reduce((sum, tx) => sum + Number(tx.amount), 0);
 
-      const expectedAmount = hasManualDebt ? manualTx.amount : duesValue;
-
-      let isPaidThisMonth = false;
-      if (runningCredit >= expectedAmount) {
-        runningCredit -= expectedAmount;
-        isPaidThisMonth = true;
-      }
-
-      if (m === month) {
-        return isPaidThisMonth ? 'paid' : 'unpaid';
-      }
-    }
-
-    return 'none';
+    return collectedCredit >= expectedDebit ? 'paid' : 'unpaid';
   };
 
   const stats = useMemo(() => {
     const actualCollection = transactions.reduce((sum, tx) => {
-      if (tx.type === 'GELİR' && tx.periodYear === selectedYear) return sum + tx.amount;
-      return sum;
+      if (tx.periodYear !== selectedYear) return sum;
+      const isCredit = tx.direction === 'CREDIT' || (!tx.direction && tx.type === 'GELİR');
+      return isCredit ? sum + Number(tx.amount) : sum;
     }, 0);
 
     const totalPending = units.reduce((sum, u) => sum + u.debt, 0);
